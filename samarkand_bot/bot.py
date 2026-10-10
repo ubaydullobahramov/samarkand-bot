@@ -87,39 +87,17 @@ def get_university(message):
     chat_id = message.chat.id
     user_data[chat_id]['university'] = message.text
 
-    # 5. ФОРМАТ ПОЕЗДКИ (ИНЛАЙН КНОПКИ)
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    markup.add(
-        types.InlineKeyboardButton("Solo", callback_data="comp_Solo"),
-        types.InlineKeyboardButton("With a Friend", callback_data="comp_With a Friend"),
-        types.InlineKeyboardButton("With a Partner", callback_data="comp_With a Partner")
-    )
-    bot.send_message(chat_id, "Are you traveling solo or coming with someone?", reply_markup=markup)
-
-# 6. ФИКСАЦИЯ ЛИДА И ОТПРАВКА РЕКВИЗИТОВ
-@bot.callback_query_handler(func=lambda call: call.data.startswith("comp_"))
-def process_companion(call):
-    bot.answer_callback_query(call.id)  # Обязательно гасим анимацию загрузки кнопки
-    chat_id = call.message.chat.id
-    companion = call.data.split("comp_")[1]
-    
-    if chat_id not in user_data:
-        user_data[chat_id] = {'username': call.from_user.username or "no_username"}
-    user_data[chat_id]['companion'] = companion
-
-    # --- ОТПРАВКА ЛИДА В АДМИН-ГРУППУ ---
+    # 5. ФИКСАЦИЯ ЛИДА И ОТПРАВКА РЕКВИЗИТОВ (Сразу после университета)
     lead_info = (
         "⚠️ **UNFINISHED APPLICATION (LEAD)**\n"
         "User reached the payment step but hasn't sent a receipt yet!\n\n"
         f"👤 **Name:** {user_data[chat_id].get('fio', 'Not provided')}\n"
         f"📱 **Phone:** {user_data[chat_id].get('phone', 'Not provided')}\n"
         f"🎓 **University:** {user_data[chat_id].get('university', 'Not provided')}\n"
-        f"👥 **Format:** {user_data[chat_id].get('companion')}\n"
         f"🔗 **TG:** @{user_data[chat_id].get('username')} (ID: `{chat_id}`)"
     )
     bot.send_message(ADMIN_GROUP_ID, lead_info, parse_mode="Markdown")
 
-    # --- ОТПРАВКА РЕКВИЗИТОВ ПОЛЬЗОВАТЕЛЮ ---
     payment_info = (
         "💳 **Payment Details:**\n\n"
         f"**Card:** `{CARD_NUMBER}`\n"
@@ -130,7 +108,7 @@ def process_companion(call):
     msg = bot.send_message(chat_id, payment_info, parse_mode="Markdown")
     bot.register_next_step_handler(msg, get_receipt)
 
-# 7. ПОЛУЧЕНИЕ СКРИНА ОПЛАТЫ
+# 6. ПОЛУЧЕНИЕ СКРИНА ОПЛАТЫ
 def get_receipt(message):
     chat_id = message.chat.id
 
@@ -146,7 +124,6 @@ def get_receipt(message):
         f"👤 **Name:** {user_data[chat_id].get('fio', 'N/A')}\n"
         f"📱 **Phone:** {user_data[chat_id].get('phone', 'N/A')}\n"
         f"🎓 **University:** {user_data[chat_id].get('university', 'N/A')}\n"
-        f"👥 **Format:** {user_data[chat_id].get('companion', 'N/A')}\n"
         f"🔗 **TG:** @{user_data[chat_id].get('username')} (ID: `{chat_id}`)"
     )
 
@@ -159,7 +136,7 @@ def get_receipt(message):
     bot.send_photo(ADMIN_GROUP_ID, photo_id, caption=caption_admin, parse_mode="Markdown", reply_markup=markup)
     bot.send_message(chat_id, "Thank you! Your receipt has been submitted for review. Please wait for confirmation from an administrator.")
 
-# 8. КНОПКИ АДМИНА (APPROVE / REJECT)
+# 7. КНОПКИ АДМИНА (APPROVE / REJECT)
 @bot.callback_query_handler(func=lambda call: call.data.startswith(('app_', 'rej_')))
 def process_admin_decision(call):
     bot.answer_callback_query(call.id)
