@@ -60,6 +60,8 @@ def start_cmd(message):
 def ask_fio(call):
     bot.answer_callback_query(call.id)
     chat_id = call.message.chat.id
+    if chat_id not in user_data:
+        user_data[chat_id] = {'username': call.from_user.username or "no_username"}
     msg = bot.send_message(chat_id, "Please enter your **Full Name**:", parse_mode="Markdown")
     bot.register_next_step_handler(msg, get_fio)
 
@@ -97,18 +99,21 @@ def get_university(message):
 # 6. ФИКСАЦИЯ ЛИДА И ОТПРАВКА РЕКВИЗИТОВ
 @bot.callback_query_handler(func=lambda call: call.data.startswith("comp_"))
 def process_companion(call):
-    bot.answer_callback_query(call.id)
+    bot.answer_callback_query(call.id)  # Обязательно гасим анимацию загрузки кнопки
     chat_id = call.message.chat.id
     companion = call.data.split("comp_")[1]
+    
+    if chat_id not in user_data:
+        user_data[chat_id] = {'username': call.from_user.username or "no_username"}
     user_data[chat_id]['companion'] = companion
 
     # --- ОТПРАВКА ЛИДА В АДМИН-ГРУППУ ---
     lead_info = (
         "⚠️ **UNFINISHED APPLICATION (LEAD)**\n"
         "User reached the payment step but hasn't sent a receipt yet!\n\n"
-        f"👤 **Name:** {user_data[chat_id].get('fio')}\n"
-        f"📱 **Phone:** {user_data[chat_id].get('phone')}\n"
-        f"🎓 **University:** {user_data[chat_id].get('university')}\n"
+        f"👤 **Name:** {user_data[chat_id].get('fio', 'Not provided')}\n"
+        f"📱 **Phone:** {user_data[chat_id].get('phone', 'Not provided')}\n"
+        f"🎓 **University:** {user_data[chat_id].get('university', 'Not provided')}\n"
         f"👥 **Format:** {user_data[chat_id].get('companion')}\n"
         f"🔗 **TG:** @{user_data[chat_id].get('username')} (ID: `{chat_id}`)"
     )
@@ -138,10 +143,10 @@ def get_receipt(message):
 
     caption_admin = (
         "💳 **NEW PAYMENT FOR VERIFICATION (Samarkand Trip)!**\n\n"
-        f"👤 **Name:** {user_data[chat_id].get('fio')}\n"
-        f"📱 **Phone:** {user_data[chat_id].get('phone')}\n"
-        f"🎓 **University:** {user_data[chat_id].get('university')}\n"
-        f"👥 **Format:** {user_data[chat_id].get('companion')}\n"
+        f"👤 **Name:** {user_data[chat_id].get('fio', 'N/A')}\n"
+        f"📱 **Phone:** {user_data[chat_id].get('phone', 'N/A')}\n"
+        f"🎓 **University:** {user_data[chat_id].get('university', 'N/A')}\n"
+        f"👥 **Format:** {user_data[chat_id].get('companion', 'N/A')}\n"
         f"🔗 **TG:** @{user_data[chat_id].get('username')} (ID: `{chat_id}`)"
     )
 
