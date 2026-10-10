@@ -1,168 +1,111 @@
+import http.server
+import socketserver
+import threading
 import telebot
 from telebot import types
 
-# ---------------- CONFIG ----------------
-TOKEN = '8952248333:AAGAKzBkfbALsyoeXt9CoGuLuKNRz4GLLLk'  # Ваш токен
-ADMIN_GROUP_ID = -5102424349                            # ID группы для лидов и чеков
-INVITE_LINK = 'https://t.me/+EZ9s8IqwbpMxZTcy'         # Ссылка после оплаты
-ADMIN_CONTACT = '@uwedsuadmin'                          # Контакт админа для связи
+# 1. Запуск фейкового веб-сервера на порту 10000 для прохождения Health Check на Render
+def run_dummy_server():
+    port = 10000
+    handler = http.server.SimpleHTTPRequestHandler
+    with socketserver.TCPServer(("", port), handler) as httpd:
+        print(f"Dummy web server running on port {port}")
+        httpd.serve_forever()
 
-CARD_NUMBER = '5614 6821 0314 3055'
-CARD_HOLDER = 'BAXRAMOV UBAYDULLO'
-PRICE = '299,000 UZS'
-# ----------------------------------------
+# Запускаем сервер в фоновом потоке
+threading.Thread(target=run_dummy_server, daemon=True).start()
 
+# 2. Настройки Telegram бота
+TOKEN = 'ТВОЙ_ТОКЕН_БОТА'  # Вставь сюда токен своего бота
 bot = telebot.TeleBot(TOKEN)
+
+ADMIN_GROUP_ID = -5102424349
+SUPPORT_USERNAME = '@uwedsuadmin'
+PRICE_TEXT = "299,000 UZS"
+TRIP_DATE = "25 октября"
+CARD_DETAILS = "5614 6821 0314 3055 (BAXRAMOV UBAYDULLO)"
+
+# Словарь для временного сохранения данных пользователей
 user_data = {}
 
-# 1. СТАРТ И ИНФО О ТРИПЕ
 @bot.message_handler(commands=['start'])
-def start_cmd(message):
-    chat_id = message.chat.id
-    user_data[chat_id] = {'username': message.from_user.username or "no_username"}
-
-    caption_text = (
-        "🕌 **JOURNEY TO ANCIENT SAMARKAND!**\n\n"
-        "Get ready to explore the heart of the Silk Road with us!\n\n"
-        "**What’s included:**\n"
-        "🚌 Comfortable transportation (there & back)\n"
-        "📸 Professional photographer\n"
-        "🍲 Delicious Zigir Osh from the center of Samarkand\n"
-        "🎲 UNO & Mafia games\n"
-        "👥 Great team & energetic vibe\n\n"
-        "📅 **Date:** October 25\n"
-        "💰 **Price:** 299,000 UZS\n"
-        "⚡ **Spots:** Limited to 100 places only!\n\n"
-        "Ready to travel back in time with us?"
-    )
-
+def send_welcome(message):
     markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("Continue ➡️", callback_data="step_fio"))
+    btn_register = types.InlineKeyboardButton("📝 Записаться на поездку", callback_data='register')
+    markup.add(btn_register)
+    
+    welcome_text = (
+        f" Salam! Добро пожаловать в официальный бот поездки в Самарканд!\n\n"
+        f"📅 **Дата поездки:** {TRIP_DATE}\n"
+        f"💰 **Стоимость:** {PRICE_TEXT}\n"
+        f"👥 **Вместимость группы:** 100 человек\n\n"
+        f"Нажмите кнопку ниже, чтобы пройти регистрацию."
+    )
+    bot.send_message(message.chat.id, welcome_text, parse_mode='Markdown', reply_markup=markup)
 
-    photo_url = "https://picsum.photos/800/500" 
-    bot.send_photo(chat_id, photo_url, caption=caption_text, parse_mode="Markdown", reply_markup=markup)
+@bot.callback_query_handler(func=lambda call: call.data == 'register')
+def request_full_name(call):
+    bot.answer_callback_query(call.id)
+    msg = bot.send_message(call.message.chat.id, "Введите ваши ФИО (Фамилия Имя Отчество):")
+    bot.register_next_step_handler(msg, process_full_name)
 
-# 2. ЗАПРОС ФИО
-@bot.callback_query_handler(func=lambda call: call.data == "step_fio")
-def ask_fio(call):
-    chat_id = call.message.chat.id
-    msg = bot.send_message(chat_id, "Please enter your **Full Name**:", parse_mode="Markdown")
-    bot.register_next_step_handler(msg, get_fio)
-
-def get_fio(message):
+def process_full_name(message):
     chat_id = message.chat.id
-    user_data[chat_id]['fio'] = message.text
+    user_data[chat_id] = {'name': message.text}
+    
+    msg = bot.send_message(chat_id, "Введите ваш номер телефона (например, +998901234567):")
+    bot.register_next_step_handler(msg, process_phone)
 
-    # 3. ЗАПРОС ТЕЛЕФОНА
-    msg = bot.send_message(chat_id, "Please enter your **phone number**:")
-    bot.register_next_step_handler(msg, get_phone)
-
-def get_phone(message):
+def process_phone(message):
     chat_id = message.chat.id
     user_data[chat_id]['phone'] = message.text
+    
+    payment_text = (
+        f"💳 **Реквизиты для оплаты:**\n\n"
+        f"Получатель: {CARD_DETAILS}\n"
+        f"Сумма: {PRICE_TEXT}\n\n"
+        f"Пожалуйста, совершите перевод и отправьте **скриншот или фото чека** ответным сообщением сюда."
+    )
+    msg = bot.send_message(chat_id, payment_text, parse_mode='Markdown')
+    bot.register_next_step_handler(msg, process_receipt)
 
-    # 4. ЗАПРОС УНИВЕРСИТЕТА
-    msg = bot.send_message(chat_id, "Which **university** do you attend?")
-    bot.register_next_step_handler(msg, get_university)
-
-def get_university(message):
+def process_receipt(message):
     chat_id = message.chat.id
-    user_data[chat_id]['university'] = message.text
-
-    # 5. ФОРМАТ ПОЕЗДКИ (ИНЛАЙН КНОПКИ)
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    markup.add(
-        types.InlineKeyboardButton("Solo", callback_data="comp_Solo"),
-        types.InlineKeyboardButton("With a Friend", callback_data="comp_With a Friend"),
-        types.InlineKeyboardButton("With a Partner", callback_data="comp_With a Partner")
-    )
-    bot.send_message(chat_id, "Are you traveling solo or coming with someone?", reply_markup=markup)
-
-# 6. ФИКСАЦИЯ ЛИДА И ОТПРАВКА РЕКВИЗИТОВ
-@bot.callback_query_handler(func=lambda call: call.data.startswith("comp_"))
-def process_companion(call):
-    chat_id = call.message.chat.id
-    companion = call.data.split("comp_")[1]
-    user_data[chat_id]['companion'] = companion
-
-    # --- ОТПРАВКА ЛИДА В АДМИН-ГРУППУ ---
-    lead_info = (
-        "⚠️ **UNFINISHED APPLICATION (LEAD)**\n"
-        "User reached the payment step but hasn't sent a receipt yet!\n\n"
-        f"👤 **Name:** {user_data[chat_id].get('fio')}\n"
-        f"📱 **Phone:** {user_data[chat_id].get('phone')}\n"
-        f"🎓 **University:** {user_data[chat_id].get('university')}\n"
-        f"👥 **Format:** {user_data[chat_id].get('companion')}\n"
-        f"🔗 **TG:** @{user_data[chat_id].get('username')} (ID: `{chat_id}`)"
-    )
-    bot.send_message(ADMIN_GROUP_ID, lead_info, parse_mode="Markdown")
-
-    # --- ОТПРАВКА РЕКВИЗИТОВ ПОЛЬЗОВАТЕЛЮ ---
-    payment_info = (
-        "💳 **Payment Details:**\n\n"
-        f"**Card:** `{CARD_NUMBER}`\n"
-        f"**Account Holder:** {CARD_HOLDER}\n"
-        f"**Amount:** {PRICE}\n\n"
-        "After transfer, **please send a screenshot/receipt of your payment here**."
-    )
-    msg = bot.send_message(chat_id, payment_info, parse_mode="Markdown")
-    bot.register_next_step_handler(msg, get_receipt)
-
-# 7. ПОЛУЧЕНИЕ СКРИНА ОПЛАТЫ
-def get_receipt(message):
-    chat_id = message.chat.id
-
-    if message.content_type != 'photo':
-        msg = bot.send_message(chat_id, "Please send a photo/screenshot of the payment receipt.")
-        bot.register_next_step_handler(msg, get_receipt)
+    if not message.photo and not message.document:
+        msg = bot.send_message(chat_id, "⚠️ Пожалуйста, отправьте именно фото или документ чека об оплате!")
+        bot.register_next_step_handler(msg, process_receipt)
         return
 
-    photo_id = message.photo[-1].file_id
+    user_info = user_data.get(chat_id, {})
+    name = user_info.get('name', 'Не указано')
+    phone = user_info.get('phone', 'Не указано')
+    username = f"@{message.from_user.username}" if message.from_user.username 'Нет username'
 
-    caption_admin = (
-        "💳 **NEW PAYMENT FOR VERIFICATION (Samarkand Trip)!**\n\n"
-        f"👤 **Name:** {user_data[chat_id].get('fio')}\n"
-        f"📱 **Phone:** {user_data[chat_id].get('phone')}\n"
-        f"🎓 **University:** {user_data[chat_id].get('university')}\n"
-        f"👥 **Format:** {user_data[chat_id].get('companion')}\n"
-        f"🔗 **TG:** @{user_data[chat_id].get('username')} (ID: `{chat_id}`)"
+    # Пересылаем чек и данные в админ-группу
+    caption = (
+        f"🆕 **Новая заявка на Самарканд!**\n\n"
+        f"👤 **ФИО:** {name}\n"
+        f"📞 **Телефон:** {phone}\n"
+        f"🔗 **Telegram:** {username}\n"
+        f"🆔 **ID:** `{chat_id}`"
     )
 
-    markup = types.InlineKeyboardMarkup()
-    markup.add(
-        types.InlineKeyboardButton("✅ Approve", callback_data=f"app_{chat_id}"),
-        types.InlineKeyboardButton("❌ Reject", callback_data=f"rej_{chat_id}")
+    if message.photo:
+        file_id = message.photo[-1].file_id
+        bot.send_photo(ADMIN_GROUP_ID, file_id, caption=caption, parse_mode='Markdown')
+    elif message.document:
+        file_id = message.document.file_id
+        bot.send_document(ADMIN_GROUP_ID, file_id, caption=caption, parse_mode='Markdown')
+
+    success_text = (
+        f"✅ **Спасибо! Ваша заявка и чек приняты.**\n\n"
+        f"Администратор скоро проверит платеж и свяжется с вами.\n"
+        f"Ссылка на закрытую группу поездки: [Нажми сюда для входа](https://t.me/+EZ9s8IqwbpMxZTcy)\n"
+        f"По всем вопросам: {SUPPORT_USERNAME}"
     )
+    bot.send_message(chat_id, success_text, parse_mode='Markdown', disable_web_page_preview=True)
 
-    bot.send_photo(ADMIN_GROUP_ID, photo_id, caption=caption_admin, parse_mode="Markdown", reply_markup=markup)
-    bot.send_message(chat_id, "Thank you! Your receipt has been submitted for review. Please wait for confirmation from an administrator.")
-
-# 8. КНОПКИ АДМИНА (APPROVE / REJECT)
-@bot.callback_query_handler(func=lambda call: call.data.startswith(('app_', 'rej_')))
-def process_admin_decision(call):
-    action, user_id = call.data.split('_')
-    user_id = int(user_id)
-
-    if action == 'app':
-        bot.send_message(
-            user_id,
-            f"🎉 **Payment Approved!**\n\nWelcome to the Samarkand trip! Join our private chat group for all trip updates and logistics:\n{INVITE_LINK}",
-            parse_mode="Markdown"
-        )
-        bot.edit_message_caption(
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            caption=call.message.caption + "\n\n🟢 **APPROVED**"
-        )
-    elif action == 'rej':
-        bot.send_message(
-            user_id,
-            f"❌ Unfortunately, your payment could not be verified. If you think this is an error, please contact the trip organizers: {ADMIN_CONTACT}"
-        )
-        bot.edit_message_caption(
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            caption=call.message.caption + "\n\n🔴 **REJECTED**"
-        )
-
-bot.infinity_polling()
+# Запуск бота в бесконечном цикле опроса
+if __name__ == '__main__':
+    print("Bot is starting...")
+    bot.infinity_polling()
