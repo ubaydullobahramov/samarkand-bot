@@ -16,7 +16,7 @@ from telebot import types
 
 TOKEN = '8952248333:AAGAKzBkfbALsyoeXt9CoGuLuKNRz4GLLLk'
 
-ADMIN_GROUP_ID = -5102424349
+ADMIN_GROUP_ID = -4487103832
 INVITE_LINK = 'https://t.me/+EZ9s8IqwbpMxZTcy'
 ADMIN_CONTACT = '@uwedsuadmin'
 
@@ -233,6 +233,37 @@ def send_payment_details(chat_id):
     bot.send_message(chat_id, payment_info)
 
 
+def send_to_admin(method, *args, **kwargs):
+    """
+    Sends a message to the admin group.
+
+    If the group was upgraded to a supergroup, Telegram rejects the old
+    chat ID and returns the new one. In that case we switch to the new
+    ID, log it loudly and retry once.
+    """
+    global ADMIN_GROUP_ID
+
+    try:
+        return method(ADMIN_GROUP_ID, *args, **kwargs)
+
+    except telebot.apihelper.ApiTelegramException as e:
+        result_json = getattr(e, "result_json", None) or {}
+        parameters = result_json.get("parameters") or {}
+        new_id = parameters.get("migrate_to_chat_id")
+
+        if not new_id:
+            raise
+
+        logger.warning(
+            "Admin group was upgraded to a supergroup. "
+            "NEW ADMIN_GROUP_ID = %s  <-- put this value into the code",
+            new_id
+        )
+
+        ADMIN_GROUP_ID = new_id
+        return method(ADMIN_GROUP_ID, *args, **kwargs)
+
+
 def notify_admin_lead(application_id):
     app = get_application(application_id)
 
@@ -251,9 +282,20 @@ def notify_admin_lead(application_id):
     )
 
     try:
-        bot.send_message(ADMIN_GROUP_ID, lead)
+        send_to_admin(bot.send_message, lead)
     except Exception:
         logger.exception("Failed to send lead to admin group")
+
+
+# ---------------- CHAT ID ----------------
+
+@bot.message_handler(commands=["chatid"])
+def chat_id_cmd(message):
+    # Send /chatid in the admin group to see its current ID.
+    bot.reply_to(
+        message,
+        f"Chat ID: <code>{message.chat.id}</code>"
+    )
 
 
 # ---------------- START ----------------
@@ -603,15 +645,15 @@ def get_receipt(message, application_id):
 
     try:
         if receipt_type == "photo":
-            bot.send_photo(
-                ADMIN_GROUP_ID,
+            send_to_admin(
+                bot.send_photo,
                 file_id,
                 caption=caption,
                 reply_markup=markup
             )
         else:
-            bot.send_document(
-                ADMIN_GROUP_ID,
+            send_to_admin(
+                bot.send_document,
                 file_id,
                 caption=caption,
                 reply_markup=markup
