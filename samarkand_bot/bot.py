@@ -31,7 +31,7 @@ PRICE_UZS = 169000
 TRIP_NAME = 'SUQOQ FOREST TRIP'
 
 # Total number of spots. Pending + approved applications take a spot.
-MAX_SPOTS = 150
+MAX_SPOTS = 130
 
 # Remind people who filled the form but did not send a receipt
 # after this many hours (one reminder per application).
@@ -45,7 +45,8 @@ SHEET_SECRET = 'suqoq-2026'
 TASHKENT_TZ = timezone(timedelta(hours=5))
 
 PORT = int(os.environ.get("PORT", "10000"))
-DB_PATH = os.environ.get("DB_PATH", "bot_data.sqlite3")
+# New file name = clean start without the test applications.
+DB_PATH = os.environ.get("DB_PATH", "suqoq_trip.sqlite3")
 
 # Render sets this automatically for web services. The bot pings itself
 # every 10 minutes so the free instance does not fall asleep.
@@ -553,6 +554,58 @@ def ask_for_step(chat_id, app):
         )
 
 
+def tickets_left_text(left):
+    """Excited message about how many tickets are left."""
+    if left <= 0:
+        return (
+            f"😔 <b>SOLD OUT!</b> All {MAX_SPOTS} tickets are gone.\n\n"
+            "Thank you for your interest! Follow our channels "
+            "so you don't miss the next trip.\n"
+            f"Questions: {safe(ADMIN_CONTACT)}"
+        )
+
+    if left == MAX_SPOTS:
+        return (
+            "🤩 <b>WOW, you're right on time!</b>\n\n"
+            f"All <b>{MAX_SPOTS} tickets</b> are still available — "
+            "be the very first to grab yours! 🥇"
+        )
+
+    if left > 50:
+        return (
+            "😍 <b>WOW, you can still make it!</b>\n\n"
+            f"🎟 <b>{left} of {MAX_SPOTS}</b> tickets left — "
+            "grab yours before they're gone!"
+        )
+
+    if left > 20:
+        return (
+            "🔥 <b>Tickets are going fast!</b>\n\n"
+            f"🎟 Only <b>{left} of {MAX_SPOTS}</b> tickets left!"
+        )
+
+    if left > 5:
+        return (
+            "⚡ <b>HURRY UP!</b>\n\n"
+            f"🎟 Only <b>{left}</b> tickets left!"
+        )
+
+    return (
+        f"🚨 <b>LAST {left} TICKET{'S' if left > 1 else ''}!</b>\n\n"
+        "Don't miss your chance — register right now!"
+    )
+
+
+def approved_count():
+    with get_db() as conn:
+        row = conn.execute("""
+            SELECT COUNT(*) AS n
+            FROM applications
+            WHERE status = 'approved'
+        """).fetchone()
+        return row["n"]
+
+
 def full_message(chat_id):
     bot.send_message(
         chat_id,
@@ -602,13 +655,6 @@ def start_cmd(message):
     user_id = message.from_user.id
     left = spots_left()
 
-    if left > 0:
-        spots_line = f"🔥 <b>Spots left:</b> {left} of {MAX_SPOTS}\n\n"
-        ending = "Ready for the mountains?"
-    else:
-        spots_line = f"😔 <b>All {MAX_SPOTS} spots are taken.</b>\n\n"
-        ending = f"Registration is closed. Questions: {safe(ADMIN_CONTACT)}"
-
     caption = (
         "🌲 <b>JOURNEY TO SUQOQ FOREST!</b>\n\n"
         "Get ready to escape the city and explore "
@@ -624,20 +670,8 @@ def start_cmd(message):
         "📅 <b>Date:</b> November 8 (Sunday)\n"
         "⏰ <b>Meeting:</b> 06:30\n"
         "📍 <b>Destination:</b> Suqoq, Tashkent region\n"
-        f"💰 <b>Price:</b> {safe(PRICE)}\n"
-        f"{spots_line}"
-        f"{ending}"
+        f"💰 <b>Price:</b> {safe(PRICE)}"
     )
-
-    markup = None
-    if left > 0:
-        markup = types.InlineKeyboardMarkup()
-        markup.add(
-            types.InlineKeyboardButton(
-                "Continue ➡️",
-                callback_data="step_fio"
-            )
-        )
 
     poster_path = next(
         (p for p in POSTER_FILES if os.path.exists(p)),
@@ -647,26 +681,25 @@ def start_cmd(message):
     try:
         if poster_path:
             with open(poster_path, "rb") as poster:
-                bot.send_photo(
-                    user_id,
-                    poster,
-                    caption=caption,
-                    reply_markup=markup
-                )
+                bot.send_photo(user_id, poster, caption=caption)
         else:
-            bot.send_photo(
-                user_id,
-                PHOTO_URL,
-                caption=caption,
-                reply_markup=markup
-            )
+            bot.send_photo(user_id, PHOTO_URL, caption=caption)
     except Exception:
         logger.exception("Could not send welcome photo")
-        bot.send_message(
-            user_id,
-            caption,
-            reply_markup=markup
+        bot.send_message(user_id, caption)
+
+    # Separate message with the number of tickets left + the button.
+    markup = None
+    if left > 0:
+        markup = types.InlineKeyboardMarkup()
+        markup.add(
+            types.InlineKeyboardButton(
+                "🎟 Get my ticket ➡️",
+                callback_data="step_fio"
+            )
         )
+
+    bot.send_message(user_id, tickets_left_text(left), reply_markup=markup)
 
 
 @bot.message_handler(commands=["cancel"])
@@ -1109,26 +1142,41 @@ def approve_application(call):
         return
 
     app = get_application(application_id)
+    ticket_no = approved_count()
+
+    first_line = (
+        "🥇 <b>You got the VERY FIRST ticket — legend!</b>\n"
+        if ticket_no == 1 else ""
+    )
+
+    thanks = (
+        "🙏 <b>Thank you from the organizers — "
+        "UWED Students' Union & DiploFrame!</b>\n"
+        "We can't wait to see you in the mountains. 🏔"
+    )
 
     if app["for_friend"]:
         user_text = (
-            "🎉 <b>Payment Approved!</b>\n\n"
-            f"The ticket for <b>{safe(app['fio'])}</b> is confirmed! 🌲\n"
+            "🎉 <b>CONGRATULATIONS! The ticket is confirmed!</b>\n\n"
+            f"🎟 Ticket <b>#{ticket_no}</b> of {MAX_SPOTS} — "
+            f"for <b>{safe(app['fio'])}</b>\n"
+            f"{first_line}\n"
             "📅 November 8 · ⏰ Meeting at 06:30\n\n"
             "Please send them this link to join the trip group:\n"
             f"{safe(INVITE_LINK)}\n\n"
-            "🎟️ <b>Want to buy one more ticket?</b>"
+            f"{thanks}"
         )
     else:
         user_text = (
-            "🎉 <b>Payment Approved!</b>\n\n"
-            "Welcome to the Suqoq Forest Trip! 🌲\n"
+            "🎉 <b>CONGRATULATIONS! Your ticket is confirmed!</b>\n\n"
+            f"🎟 You are participant <b>#{ticket_no}</b> of {MAX_SPOTS}\n"
+            f"{first_line}\n"
             "📅 November 8 · ⏰ Meeting at 06:30\n\n"
             "Join our private group for trip updates and logistics "
             "(meeting point, what to bring, etc.):\n"
             f"{safe(INVITE_LINK)}\n\n"
-            "🎟️ <b>Want to buy a ticket for someone else?</b>\n"
-            "You can register another participant below."
+            f"{thanks}\n\n"
+            "🎟️ Want to bring a friend? Buy them a ticket below."
         )
 
     markup = types.InlineKeyboardMarkup()
@@ -1160,7 +1208,8 @@ def approve_application(call):
 
     edit_admin_caption(
         call,
-        f"\n\n🟢 <b>APPROVED</b> by {safe(approver)}{sheet_line}"
+        f"\n\n🟢 <b>APPROVED</b> by {safe(approver)} · "
+        f"ticket #{ticket_no} of {MAX_SPOTS}{sheet_line}"
     )
 
     bot.answer_callback_query(call.id, "Approved.")
