@@ -1,5 +1,6 @@
 import os
 import html
+import time
 import sqlite3
 import threading
 import http.server
@@ -25,12 +26,19 @@ ADMIN_CONTACT = '@uwedsuadmin'
 CARD_NUMBER = '5614 6821 0314 3055'
 CARD_HOLDER = 'BAXRAMOV UBAYDULLO'
 PRICE = '169,000 UZS'
+PRICE_UZS = 169000
 
 TRIP_NAME = 'SUQOQ FOREST TRIP'
 
+# Total number of spots. Pending + approved applications take a spot.
+MAX_SPOTS = 150
+
+# Remind people who filled the form but did not send a receipt
+# after this many hours (one reminder per application).
+REMINDER_HOURS = 12
+
 # Google Sheet with the list of approved participants.
-# Paste the Web App URL from Google Apps Script here (see instructions).
-SHEET_WEBHOOK_URL = 'https://script.google.com/macros/s/AKfycbyU68a5zkIbXDMQyOm0mz9BhXEDQRjs4I7Qr43dZbTvzUcchNKBKq_Q6m3Qb3YxDrOI/exec'
+SHEET_WEBHOOK_URL = 'https://script.google.com/macros/s/AKfycby2ramJijYp6_lg0ERDq5HPzCsIoERhpCoa_BHrF_LCIJ-Sip31nW3HxZ9nshl1WEwq/exec'
 # Must be the same word as SECRET in the Apps Script code.
 SHEET_SECRET = 'suqoq-2026'
 
@@ -39,10 +47,28 @@ TASHKENT_TZ = timezone(timedelta(hours=5))
 PORT = int(os.environ.get("PORT", "10000"))
 DB_PATH = os.environ.get("DB_PATH", "bot_data.sqlite3")
 
+# Render sets this automatically for web services. The bot pings itself
+# every 10 minutes so the free instance does not fall asleep.
+SELF_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
+
 # Put the trip poster next to this file as poster.jpg (or poster.png).
 # If no poster file is found, the bot falls back to PHOTO_URL.
 POSTER_FILES = ("poster.jpg", "poster.jpeg", "poster.png")
 PHOTO_URL = "https://picsum.photos/800/500"
+
+REJECT_REASONS = {
+    "1": "Payment not received",
+    "2": "Wrong amount — the ticket price is 169,000 UZS",
+    "3": "The receipt is unreadable",
+    "4": "Other — please contact the admin",
+}
+
+ACTIVE_STATUSES = (
+    "collecting_fio",
+    "collecting_phone",
+    "collecting_university",
+    "awaiting_receipt",
+)
 
 
 # ---------------- LOGGING ----------------
@@ -75,6 +101,15 @@ def get_db():
         conn.close()
 
 
+def add_column_if_missing(conn, name, ddl):
+    columns = [
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(applications)")
+    ]
+    if name not in columns:
+        conn.execute(f"ALTER TABLE applications ADD COLUMN {ddl}")
+
+
 def init_db():
     with get_db() as conn:
         conn.execute("""
@@ -93,6 +128,19 @@ def init_db():
             )
         """)
 
+        add_column_if_missing(
+            conn, "receipt_unique_id", "receipt_unique_id TEXT"
+        )
+        add_column_if_missing(
+            conn, "for_friend", "for_friend INTEGER NOT NULL DEFAULT 0"
+        )
+        add_column_if_missing(
+            conn, "reminded", "reminded INTEGER NOT NULL DEFAULT 0"
+        )
+        add_column_if_missing(
+            conn, "reject_reason", "reject_reason TEXT"
+        )
+
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_applications_user
             ON applications(user_id)
@@ -108,7 +156,7 @@ def safe(value):
     return html.escape(str(value or ""), quote=True)
 
 
-def create_application(user_id, username):
+def create_application(user_id, username, for_friend=False):
     application_id = uuid.uuid4().hex[:12]
 
     with get_db() as conn:
@@ -117,16 +165,18 @@ def create_application(user_id, username):
                 application_id,
                 user_id,
                 username,
-                status
+                status,
+                for_friend
             )
-            VALUES (?, ?, ?, 'collecting_fio')
+            VALUES (?, ?, ?, 'collecting_fio', ?)
         """, (
             application_id,
             user_id,
-            username or "no_username"
+            username or "no_username",
+            1 if for_friend else 0
         ))
 
-    return application_id
+    return get_application(application_id)
 
 
 def get_application(application_id):
@@ -136,6 +186,20 @@ def get_application(application_id):
             FROM applications
             WHERE application_id = ?
         """, (application_id,)).fetchone()
+
+
+def get_active_application(user_id):
+    placeholders = ",".join("?" for _ in ACTIVE_STATUSES)
+
+    with get_db() as conn:
+        return conn.execute(f"""
+            SELECT *
+            FROM applications
+            WHERE user_id = ?
+              AND status IN ({placeholders})
+            ORDER BY created_at DESC, rowid DESC
+            LIMIT 1
+        """, (user_id, *ACTIVE_STATUSES)).fetchone()
 
 
 def update_application(application_id, field, value, status):
@@ -157,15 +221,70 @@ def update_application(application_id, field, value, status):
         )
 
 
+def set_status(application_id, new_status, only_if=None, extra=None):
+    """
+    Changes the status. If only_if is given, the change happens only
+    when the current status equals only_if. Returns True if changed.
+    """
+    sets = ["status = ?", "updated_at = CURRENT_TIMESTAMP"]
+    params = [new_status]
+
+    for column, value in (extra or {}).items():
+        sets.append(f"{column} = ?")
+        params.append(value)
+
+    sql = f"UPDATE applications SET {', '.join(sets)} WHERE application_id = ?"
+    params.append(application_id)
+
+    if only_if:
+        sql += " AND status = ?"
+        params.append(only_if)
+
+    with get_db() as conn:
+        result = conn.execute(sql, params)
+        return result.rowcount == 1
+
+
+def taken_spots():
+    with get_db() as conn:
+        row = conn.execute("""
+            SELECT COUNT(*) AS n
+            FROM applications
+            WHERE status IN ('pending', 'approved')
+        """).fetchone()
+        return row["n"]
+
+
+def spots_left():
+    return max(0, MAX_SPOTS - taken_spots())
+
+
+def find_duplicate_receipt(unique_id, application_id):
+    if not unique_id:
+        return None
+
+    with get_db() as conn:
+        row = conn.execute("""
+            SELECT application_id, fio
+            FROM applications
+            WHERE receipt_unique_id = ?
+              AND application_id != ?
+            ORDER BY created_at
+            LIMIT 1
+        """, (unique_id, application_id)).fetchone()
+        return row
+
+
 # ---------------- RENDER HEALTH SERVER ----------------
 
 class HealthHandler(http.server.BaseHTTPRequestHandler):
 
-    def do_GET(self):
+    def _ok(self, body=True):
         if self.path not in ("/", "/health"):
             self.send_response(404)
             self.end_headers()
-            self.wfile.write(b"Not found")
+            if body:
+                self.wfile.write(b"Not found")
             return
 
         self.send_response(200)
@@ -174,7 +293,14 @@ class HealthHandler(http.server.BaseHTTPRequestHandler):
             "text/plain; charset=utf-8"
         )
         self.end_headers()
-        self.wfile.write(b"Bot is running")
+        if body:
+            self.wfile.write(b"Bot is running")
+
+    def do_GET(self):
+        self._ok(body=True)
+
+    def do_HEAD(self):
+        self._ok(body=False)
 
     def log_message(self, format, *args):
         pass
@@ -193,55 +319,23 @@ def run_web_server():
         server.serve_forever()
 
 
-# ---------------- HELPERS ----------------
+def keep_alive():
+    if not SELF_URL:
+        logger.info("RENDER_EXTERNAL_URL not set — self-ping is off")
+        return
 
-def ask_text(chat_id, prompt, next_handler, application_id):
-    msg = bot.send_message(chat_id, prompt)
+    url = SELF_URL.rstrip("/") + "/health"
+    logger.info("Self-ping enabled: %s", url)
 
-    bot.register_next_step_handler(
-        msg,
-        next_handler,
-        application_id
-    )
-
-
-def start_application(chat_id, user_id, username):
-    application_id = create_application(
-        user_id,
-        username
-    )
-
-    ask_text(
-        chat_id,
-        "Please enter your <b>Full Name</b>:",
-        get_fio,
-        application_id
-    )
+    while True:
+        time.sleep(600)
+        try:
+            requests.get(url, timeout=20)
+        except Exception:
+            logger.warning("Self-ping failed")
 
 
-def payment_contact_message():
-    return (
-        "❓ <b>Questions about payment?</b>\n\n"
-        "If you have any questions or problems with payment, "
-        "please contact Nazar:\n"
-        f"👤 {safe(ADMIN_CONTACT)}"
-    )
-
-
-def send_payment_details(chat_id):
-    payment_info = (
-        "💳 <b>Payment Details</b>\n\n"
-        f"<b>Card:</b> <code>{safe(CARD_NUMBER)}</code>\n"
-        f"<b>Account Holder:</b> {safe(CARD_HOLDER)}\n"
-        f"<b>Amount:</b> {safe(PRICE)}\n\n"
-        "After transferring the money, please send a photo "
-        "or a PDF document of your payment receipt here.\n\n"
-        "❓ <b>Questions about payment?</b>\n"
-        f"Contact Nazar: {safe(ADMIN_CONTACT)}"
-    )
-
-    bot.send_message(chat_id, payment_info)
-
+# ---------------- ADMIN GROUP ----------------
 
 def send_to_admin(method, *args, **kwargs):
     """
@@ -273,6 +367,76 @@ def send_to_admin(method, *args, **kwargs):
         ADMIN_GROUP_ID = new_id
         return method(ADMIN_GROUP_ID, *args, **kwargs)
 
+
+def is_admin_chat(message):
+    return message.chat.id == ADMIN_GROUP_ID
+
+
+def application_card(app):
+    friend_line = (
+        "👥 <b>Ticket for another participant</b> "
+        f"(bought by @{safe(app['username'])})\n"
+        if app["for_friend"] else ""
+    )
+
+    return (
+        f"🎫 <b>Application:</b> <code>{safe(app['application_id'])}</code>\n"
+        f"{friend_line}"
+        f"👤 <b>Name:</b> {safe(app['fio'])}\n"
+        f"📱 <b>Phone:</b> {safe(app['phone'])}\n"
+        f"🎓 <b>University:</b> {safe(app['university'])}\n"
+        f"🔗 <b>TG:</b> @{safe(app['username'])}\n"
+        f"🆔 <b>User ID:</b> <code>{app['user_id']}</code>"
+    )
+
+
+def notify_admin_lead(app):
+    lead = (
+        f"⚠️ <b>NEW LEAD — {safe(TRIP_NAME)}</b>\n"
+        "Form filled, payment details sent, receipt not yet received.\n\n"
+        + application_card(app)
+    )
+
+    try:
+        send_to_admin(bot.send_message, lead)
+    except Exception:
+        logger.exception("Failed to send lead to admin group")
+
+
+def decision_markup(application_id):
+    markup = types.InlineKeyboardMarkup()
+    markup.row(
+        types.InlineKeyboardButton(
+            "✅ Approve",
+            callback_data=f"app_{application_id}"
+        ),
+        types.InlineKeyboardButton(
+            "❌ Reject",
+            callback_data=f"rej_{application_id}"
+        )
+    )
+    return markup
+
+
+def reject_reasons_markup(application_id):
+    markup = types.InlineKeyboardMarkup()
+    for code, text in REJECT_REASONS.items():
+        markup.add(
+            types.InlineKeyboardButton(
+                text,
+                callback_data=f"rr_{code}_{application_id}"
+            )
+        )
+    markup.add(
+        types.InlineKeyboardButton(
+            "↩️ Back",
+            callback_data=f"back_{application_id}"
+        )
+    )
+    return markup
+
+
+# ---------------- GOOGLE SHEET ----------------
 
 def save_to_sheet(app, approved_by):
     """
@@ -316,41 +480,119 @@ def save_to_sheet(app, approved_by):
         return False
 
 
-def notify_admin_lead(application_id):
-    app = get_application(application_id)
+# ---------------- USER FLOW ----------------
 
-    if not app:
-        return
-
-    lead = (
-        f"⚠️ <b>APPLICATION — PAYMENT DETAILS SENT — {safe(TRIP_NAME)}</b>\n\n"
-        f"🎫 <b>Application:</b> "
-        f"<code>{safe(application_id)}</code>\n"
-        f"👤 <b>Name:</b> {safe(app['fio'])}\n"
-        f"📱 <b>Phone:</b> {safe(app['phone'])}\n"
-        f"🎓 <b>University:</b> {safe(app['university'])}\n"
-        f"🔗 <b>TG:</b> @{safe(app['username'])}\n"
-        f"🆔 <b>User ID:</b> <code>{app['user_id']}</code>"
+def payment_details_text():
+    return (
+        "💳 <b>Payment Details</b>\n\n"
+        f"<b>Card:</b> <code>{safe(CARD_NUMBER)}</code>\n"
+        f"<b>Account Holder:</b> {safe(CARD_HOLDER)}\n"
+        f"<b>Amount:</b> {safe(PRICE)}\n\n"
+        "After transferring the money, send a <b>photo</b> "
+        "or a <b>PDF</b> of your payment receipt here.\n\n"
+        "❓ <b>Questions about payment?</b>\n"
+        f"Contact Nazar: {safe(ADMIN_CONTACT)}"
     )
 
-    try:
-        send_to_admin(bot.send_message, lead)
-    except Exception:
-        logger.exception("Failed to send lead to admin group")
+
+def phone_keyboard():
+    markup = types.ReplyKeyboardMarkup(
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+    markup.add(
+        types.KeyboardButton(
+            "📱 Share my phone number",
+            request_contact=True
+        )
+    )
+    return markup
 
 
-# ---------------- CHAT ID ----------------
+def ask_for_step(chat_id, app):
+    """Asks the question that matches the application's current step."""
+    status = app["status"]
+    friend = bool(app["for_friend"])
+
+    if status == "collecting_fio":
+        text = (
+            "👥 Enter the <b>Full Name</b> of the participant "
+            "you are buying a ticket for:"
+            if friend else
+            "Please enter your <b>Full Name</b>:"
+        )
+        bot.send_message(chat_id, text, reply_markup=types.ReplyKeyboardRemove())
+
+    elif status == "collecting_phone":
+        if friend:
+            bot.send_message(
+                chat_id,
+                "Enter the participant's <b>phone number</b>:",
+                reply_markup=types.ReplyKeyboardRemove()
+            )
+        else:
+            bot.send_message(
+                chat_id,
+                "Please share or type your <b>phone number</b>:",
+                reply_markup=phone_keyboard()
+            )
+
+    elif status == "collecting_university":
+        text = (
+            "Which <b>university</b> does the participant attend?"
+            if friend else
+            "Which <b>university</b> do you attend?"
+        )
+        bot.send_message(chat_id, text, reply_markup=types.ReplyKeyboardRemove())
+
+    elif status == "awaiting_receipt":
+        bot.send_message(chat_id, payment_details_text())
+        bot.send_message(
+            chat_id,
+            "📸 Please send your payment receipt as a photo or PDF document."
+        )
+
+
+def full_message(chat_id):
+    bot.send_message(
+        chat_id,
+        f"😔 <b>All {MAX_SPOTS} spots are taken.</b>\n\n"
+        "Registration for the Suqoq Forest Trip is closed. "
+        f"Questions: {safe(ADMIN_CONTACT)}",
+        reply_markup=types.ReplyKeyboardRemove()
+    )
+
+
+def start_or_resume(chat_id, user_id, username, for_friend=False):
+    if not for_friend:
+        active = get_active_application(user_id)
+        if active:
+            bot.send_message(
+                chat_id,
+                "↩️ You already have an unfinished application — "
+                "let's continue where you stopped.\n"
+                "To start over, send /cancel."
+            )
+            ask_for_step(chat_id, active)
+            return
+
+    if spots_left() <= 0:
+        full_message(chat_id)
+        return
+
+    app = create_application(user_id, username, for_friend=for_friend)
+    ask_for_step(chat_id, app)
+
+
+# ---------------- COMMANDS ----------------
 
 @bot.message_handler(commands=["chatid"])
 def chat_id_cmd(message):
-    # Send /chatid in the admin group to see its current ID.
     bot.reply_to(
         message,
         f"Chat ID: <code>{message.chat.id}</code>"
     )
 
-
-# ---------------- START ----------------
 
 @bot.message_handler(commands=["start"])
 def start_cmd(message):
@@ -358,7 +600,14 @@ def start_cmd(message):
         return
 
     user_id = message.from_user.id
-    username = message.from_user.username or "no_username"
+    left = spots_left()
+
+    if left > 0:
+        spots_line = f"🔥 <b>Spots left:</b> {left} of {MAX_SPOTS}\n\n"
+        ending = "Ready for the mountains?"
+    else:
+        spots_line = f"😔 <b>All {MAX_SPOTS} spots are taken.</b>\n\n"
+        ending = f"Registration is closed. Questions: {safe(ADMIN_CONTACT)}"
 
     caption = (
         "🌲 <b>JOURNEY TO SUQOQ FOREST!</b>\n\n"
@@ -376,18 +625,19 @@ def start_cmd(message):
         "⏰ <b>Meeting:</b> 06:30\n"
         "📍 <b>Destination:</b> Suqoq, Tashkent region\n"
         f"💰 <b>Price:</b> {safe(PRICE)}\n"
-        "⚡ <b>Spots:</b> Limited to 150 places only!\n\n"
-        "Ready for the mountains?"
+        f"{spots_line}"
+        f"{ending}"
     )
 
-    markup = types.InlineKeyboardMarkup()
-
-    markup.add(
-        types.InlineKeyboardButton(
-            "Continue ➡️",
-            callback_data="step_fio"
+    markup = None
+    if left > 0:
+        markup = types.InlineKeyboardMarkup()
+        markup.add(
+            types.InlineKeyboardButton(
+                "Continue ➡️",
+                callback_data="step_fio"
+            )
         )
-    )
 
     poster_path = next(
         (p for p in POSTER_FILES if os.path.exists(p)),
@@ -419,25 +669,144 @@ def start_cmd(message):
         )
 
 
-# ---------------- NEW APPLICATION ----------------
+@bot.message_handler(commands=["cancel"])
+def cancel_cmd(message):
+    if message.chat.type != "private":
+        return
+
+    active = get_active_application(message.from_user.id)
+
+    if not active:
+        bot.send_message(
+            message.chat.id,
+            "You have no unfinished application. Send /start to begin.",
+            reply_markup=types.ReplyKeyboardRemove()
+        )
+        return
+
+    set_status(active["application_id"], "cancelled")
+    bot.send_message(
+        message.chat.id,
+        "❎ Your unfinished application was cancelled. "
+        "Send /start to begin again.",
+        reply_markup=types.ReplyKeyboardRemove()
+    )
+
+
+@bot.message_handler(commands=["stats"])
+def stats_cmd(message):
+    if not is_admin_chat(message):
+        return
+
+    with get_db() as conn:
+        rows = conn.execute("""
+            SELECT status, COUNT(*) AS n
+            FROM applications
+            GROUP BY status
+        """).fetchall()
+
+    counts = {row["status"]: row["n"] for row in rows}
+    filling = sum(
+        counts.get(s, 0)
+        for s in ("collecting_fio", "collecting_phone", "collecting_university")
+    )
+    approved = counts.get("approved", 0)
+    pending = counts.get("pending", 0)
+
+    collected = f"{approved * PRICE_UZS:,}".replace(",", " ")
+
+    text = (
+        f"📊 <b>{safe(TRIP_NAME)} — STATS</b>\n\n"
+        f"✍️ Filling the form: {filling}\n"
+        f"⏳ Got payment details, no receipt: {counts.get('awaiting_receipt', 0)}\n"
+        f"🔎 Receipts waiting for review: {pending}\n"
+        f"✅ Approved: {approved}\n"
+        f"❌ Rejected: {counts.get('rejected', 0)}\n"
+        f"❎ Cancelled: {counts.get('cancelled', 0)}\n\n"
+        f"💺 Spots left: {spots_left()} of {MAX_SPOTS}\n"
+        f"💰 Collected (approved × price): {collected} UZS"
+    )
+
+    bot.reply_to(message, text)
+
+
+@bot.message_handler(commands=["broadcast"])
+def broadcast_cmd(message):
+    if not is_admin_chat(message):
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+
+    if len(parts) < 2 or not parts[1].strip():
+        bot.reply_to(
+            message,
+            "Usage: <code>/broadcast your message</code>\n"
+            "The message is sent privately to every approved participant."
+        )
+        return
+
+    text = (
+        "📢 <b>Suqoq Forest Trip</b>\n\n"
+        + safe(parts[1].strip())
+    )
+
+    with get_db() as conn:
+        user_ids = [
+            row["user_id"]
+            for row in conn.execute("""
+                SELECT DISTINCT user_id
+                FROM applications
+                WHERE status = 'approved'
+            """).fetchall()
+        ]
+
+    if not user_ids:
+        bot.reply_to(message, "No approved participants yet.")
+        return
+
+    bot.reply_to(
+        message,
+        f"📤 Sending to {len(user_ids)} participants..."
+    )
+
+    def worker():
+        sent, failed = 0, 0
+        for uid in user_ids:
+            try:
+                bot.send_message(uid, text)
+                sent += 1
+            except Exception:
+                failed += 1
+            time.sleep(0.05)
+
+        try:
+            bot.send_message(
+                message.chat.id,
+                f"✅ Broadcast finished: {sent} sent, {failed} failed."
+            )
+        except Exception:
+            logger.exception("Could not report broadcast result")
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+# ---------------- BUTTONS (USER) ----------------
 
 @bot.callback_query_handler(
     func=lambda call: call.data == "step_fio"
 )
-def ask_fio(call):
+def continue_button(call):
     bot.answer_callback_query(call.id)
 
     if call.message.chat.type != "private":
         return
 
-    start_application(
+    start_or_resume(
         call.message.chat.id,
         call.from_user.id,
         call.from_user.username or "no_username"
     )
 
-
-# ---------------- BUY ANOTHER TICKET ----------------
 
 @bot.callback_query_handler(
     func=lambda call: call.data == "buy_another"
@@ -448,152 +817,149 @@ def buy_another_ticket(call):
     if call.message.chat.type != "private":
         return
 
-    start_application(
+    start_or_resume(
         call.message.chat.id,
         call.from_user.id,
-        call.from_user.username or "no_username"
+        call.from_user.username or "no_username",
+        for_friend=True
     )
 
 
-# ---------------- FULL NAME ----------------
+@bot.callback_query_handler(
+    func=lambda call: call.data.startswith("resend_")
+)
+def resend_receipt(call):
+    application_id = call.data.split("_", 1)[1]
+    app = get_application(application_id)
 
-def get_fio(message, application_id):
-    if message.chat.type != "private":
+    if not app or app["user_id"] != call.from_user.id:
+        bot.answer_callback_query(call.id, "Application not found.")
         return
 
-    if not message.text or not message.text.strip():
-        ask_text(
-            message.chat.id,
-            "Please enter your full name as text.",
-            get_fio,
-            application_id
+    if not set_status(
+        application_id,
+        "awaiting_receipt",
+        only_if="rejected",
+        extra={"reminded": 1}
+    ):
+        bot.answer_callback_query(
+            call.id,
+            "This application can't take a new receipt.",
+            show_alert=True
         )
         return
 
-    fio = message.text.strip()
+    bot.answer_callback_query(call.id)
+    ask_for_step(call.message.chat.id, get_application(application_id))
+
+
+# ---------------- PRIVATE MESSAGES (FORM + RECEIPT) ----------------
+
+@bot.message_handler(
+    func=lambda m: m.chat.type == "private",
+    content_types=["text", "photo", "document", "contact"]
+)
+def private_router(message):
+    if message.content_type == "text" and (message.text or "").startswith("/"):
+        bot.send_message(
+            message.chat.id,
+            "Send /start to register or /cancel to cancel "
+            "an unfinished application."
+        )
+        return
+
+    app = get_active_application(message.from_user.id)
+
+    if not app:
+        bot.send_message(
+            message.chat.id,
+            "Send /start to register for the Suqoq Forest Trip 🌲"
+        )
+        return
+
+    status = app["status"]
+
+    if status == "collecting_fio":
+        handle_fio(message, app)
+    elif status == "collecting_phone":
+        handle_phone(message, app)
+    elif status == "collecting_university":
+        handle_university(message, app)
+    elif status == "awaiting_receipt":
+        handle_receipt(message, app)
+
+
+def handle_fio(message, app):
+    fio = (message.text or "").strip() if message.content_type == "text" else ""
+
+    if not fio:
+        bot.send_message(message.chat.id, "Please enter the full name as text.")
+        return
 
     if len(fio) > 150:
-        ask_text(
-            message.chat.id,
-            "Your name is too long. Please try again.",
-            get_fio,
-            application_id
-        )
+        bot.send_message(message.chat.id, "The name is too long. Please try again.")
         return
 
-    update_application(
-        application_id,
-        "fio",
-        fio,
-        "collecting_phone"
-    )
-
-    ask_text(
-        message.chat.id,
-        "Please enter your <b>phone number</b>:",
-        get_phone,
-        application_id
-    )
+    update_application(app["application_id"], "fio", fio, "collecting_phone")
+    ask_for_step(message.chat.id, get_application(app["application_id"]))
 
 
-# ---------------- PHONE ----------------
+def handle_phone(message, app):
+    if message.content_type == "contact" and message.contact:
+        phone = message.contact.phone_number or ""
+    elif message.content_type == "text":
+        phone = (message.text or "").strip()
+    else:
+        phone = ""
 
-def get_phone(message, application_id):
-    if message.chat.type != "private":
-        return
-
-    if not message.text or not message.text.strip():
-        ask_text(
-            message.chat.id,
-            "Please enter your phone number as text.",
-            get_phone,
-            application_id
-        )
-        return
-
-    phone = message.text.strip()
     digits = "".join(ch for ch in phone if ch.isdigit())
 
     if len(digits) < 7 or len(digits) > 15 or len(phone) > 30:
-        ask_text(
-            message.chat.id,
-            "Invalid phone number. Please enter it again, "
-            "including country code if possible.",
-            get_phone,
-            application_id
-        )
-        return
-
-    update_application(
-        application_id,
-        "phone",
-        phone,
-        "collecting_university"
-    )
-
-    ask_text(
-        message.chat.id,
-        "Which <b>university</b> do you attend?",
-        get_university,
-        application_id
-    )
-
-
-# ---------------- UNIVERSITY ----------------
-
-def get_university(message, application_id):
-    if message.chat.type != "private":
-        return
-
-    if not message.text or not message.text.strip():
-        ask_text(
-            message.chat.id,
-            "Please enter your university as text.",
-            get_university,
-            application_id
-        )
-        return
-
-    university = message.text.strip()
-
-    if len(university) > 200:
-        ask_text(
-            message.chat.id,
-            "University name is too long. Please try again.",
-            get_university,
-            application_id
-        )
-        return
-
-    update_application(
-        application_id,
-        "university",
-        university,
-        "awaiting_receipt"
-    )
-
-    try:
-        notify_admin_lead(application_id)
-
-        # Contact is shown before payment instructions.
         bot.send_message(
             message.chat.id,
-            payment_contact_message()
+            "Invalid phone number. Please try again, "
+            "including the country code if possible."
         )
+        return
 
-        send_payment_details(message.chat.id)
+    if not phone.startswith("+") and len(digits) >= 11:
+        phone = "+" + digits
 
-        ask_text(
-            message.chat.id,
-            "📸 Please send your payment receipt as a photo "
-            "or PDF document.",
-            get_receipt,
-            application_id
+    update_application(app["application_id"], "phone", phone, "collecting_university")
+    ask_for_step(message.chat.id, get_application(app["application_id"]))
+
+
+def handle_university(message, app):
+    university = (
+        (message.text or "").strip() if message.content_type == "text" else ""
+    )
+
+    if not university:
+        bot.send_message(message.chat.id, "Please enter the university as text.")
+        return
+
+    if len(university) > 200:
+        bot.send_message(message.chat.id, "The name is too long. Please try again.")
+        return
+
+    if spots_left() <= 0:
+        update_application(
+            app["application_id"], "university", university, "cancelled"
         )
+        full_message(message.chat.id)
+        return
 
+    update_application(
+        app["application_id"], "university", university, "awaiting_receipt"
+    )
+
+    app = get_application(app["application_id"])
+    notify_admin_lead(app)
+
+    try:
+        ask_for_step(message.chat.id, app)
     except Exception:
         logger.exception("Failed to send payment instructions")
-
         bot.send_message(
             message.chat.id,
             "Could not send payment details. "
@@ -601,98 +967,67 @@ def get_university(message, application_id):
         )
 
 
-# ---------------- PAYMENT RECEIPT ----------------
-
-def get_receipt(message, application_id):
-    if message.chat.type != "private":
-        return
-
-    app = get_application(application_id)
-
-    if not app or app["status"] != "awaiting_receipt":
-        bot.send_message(
-            message.chat.id,
-            "This application is no longer waiting for a receipt. "
-            "Use /start to create a new application."
-        )
-        return
-
+def handle_receipt(message, app):
+    application_id = app["application_id"]
     file_id = None
+    unique_id = None
     receipt_type = None
 
     if message.content_type == "photo":
-        file_id = message.photo[-1].file_id
+        photo = message.photo[-1]
+        file_id = photo.file_id
+        unique_id = photo.file_unique_id
         receipt_type = "photo"
 
     elif message.content_type == "document":
         document = message.document
         mime_type = document.mime_type or ""
 
-        if (
-            mime_type == "application/pdf"
-            or mime_type.startswith("image/")
-        ):
+        if mime_type == "application/pdf" or mime_type.startswith("image/"):
             file_id = document.file_id
+            unique_id = document.file_unique_id
             receipt_type = "document"
 
     if not file_id:
-        ask_text(
+        bot.send_message(
             message.chat.id,
-            "⚠️ Please send a photo or a PDF/image document "
-            "of the payment receipt.",
-            get_receipt,
-            application_id
+            "⚠️ Please send a <b>photo</b> or a <b>PDF</b> of the payment receipt.\n"
+            "To start over, send /cancel."
         )
         return
 
-    # Atomically move application to pending.
-    with get_db() as conn:
-        result = conn.execute("""
-            UPDATE applications
-            SET status = 'pending',
-                receipt_file_id = ?,
-                receipt_type = ?,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE application_id = ?
-              AND status = 'awaiting_receipt'
-        """, (
-            file_id,
-            receipt_type,
-            application_id
-        ))
-
-        if result.rowcount != 1:
-            bot.send_message(
-                message.chat.id,
-                "This receipt has already been submitted "
-                "or the application has changed."
-            )
-            return
+    if not set_status(
+        application_id,
+        "pending",
+        only_if="awaiting_receipt",
+        extra={
+            "receipt_file_id": file_id,
+            "receipt_type": receipt_type,
+            "receipt_unique_id": unique_id,
+        }
+    ):
+        bot.send_message(
+            message.chat.id,
+            "This receipt has already been submitted "
+            "or the application has changed."
+        )
+        return
 
     app = get_application(application_id)
+    duplicate = find_duplicate_receipt(unique_id, application_id)
+
+    duplicate_line = ""
+    if duplicate:
+        duplicate_line = (
+            "\n\n🚨 <b>DUPLICATE RECEIPT!</b> The same file was already sent "
+            f"in application <code>{safe(duplicate['application_id'])}</code> "
+            f"({safe(duplicate['fio'])}). Check carefully before approving."
+        )
 
     caption = (
         f"💳 <b>NEW PAYMENT FOR VERIFICATION — {safe(TRIP_NAME)}</b>\n\n"
-        f"🎫 <b>Application:</b> "
-        f"<code>{safe(application_id)}</code>\n"
-        f"👤 <b>Name:</b> {safe(app['fio'])}\n"
-        f"📱 <b>Phone:</b> {safe(app['phone'])}\n"
-        f"🎓 <b>University:</b> {safe(app['university'])}\n"
-        f"🔗 <b>TG:</b> @{safe(app['username'])}\n"
-        f"🆔 <b>User ID:</b> <code>{app['user_id']}</code>"
-    )
-
-    markup = types.InlineKeyboardMarkup()
-
-    markup.row(
-        types.InlineKeyboardButton(
-            "✅ Approve",
-            callback_data=f"app_{application_id}"
-        ),
-        types.InlineKeyboardButton(
-            "❌ Reject",
-            callback_data=f"rej_{application_id}"
-        )
+        + application_card(app)
+        + duplicate_line
     )
 
     try:
@@ -701,39 +1036,25 @@ def get_receipt(message, application_id):
                 bot.send_photo,
                 file_id,
                 caption=caption,
-                reply_markup=markup
+                reply_markup=decision_markup(application_id)
             )
         else:
             send_to_admin(
                 bot.send_document,
                 file_id,
                 caption=caption,
-                reply_markup=markup
+                reply_markup=decision_markup(application_id)
             )
 
     except Exception:
         logger.exception("Failed to forward receipt to admin group")
 
-        with get_db() as conn:
-            conn.execute("""
-                UPDATE applications
-                SET status = 'awaiting_receipt',
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE application_id = ?
-                  AND status = 'pending'
-            """, (application_id,))
+        set_status(application_id, "awaiting_receipt", only_if="pending")
 
         bot.send_message(
             message.chat.id,
             "We couldn't forward your receipt for review. "
-            "Please try again."
-        )
-
-        ask_text(
-            message.chat.id,
-            "Send your receipt as a photo or PDF document.",
-            get_receipt,
-            application_id
+            "Please send it again in a minute."
         )
         return
 
@@ -744,137 +1065,85 @@ def get_receipt(message, application_id):
     )
 
 
-# ---------------- APPROVE / REJECT ----------------
+# ---------------- ADMIN DECISIONS ----------------
+
+def edit_admin_caption(call, extra_text):
+    try:
+        old_caption = safe(call.message.caption or "")
+        bot.edit_message_caption(
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            caption=old_caption + extra_text,
+            parse_mode="HTML",
+            reply_markup=None
+        )
+    except Exception:
+        logger.exception("Could not update admin receipt message")
+
+
+def approver_name(call):
+    return (
+        f"@{call.from_user.username}"
+        if call.from_user.username
+        else call.from_user.first_name
+    )
+
 
 @bot.callback_query_handler(
-    func=lambda call: call.data.startswith(("app_", "rej_"))
+    func=lambda call: call.data.startswith("app_")
 )
-def process_admin_decision(call):
-    # As requested, no administrator-ID restriction.
+def approve_application(call):
+    application_id = call.data.split("_", 1)[1]
+    app = get_application(application_id)
 
-    try:
-        action, application_id = call.data.split("_", 1)
-    except (ValueError, AttributeError):
-        bot.answer_callback_query(
-            call.id,
-            "Invalid application.",
-            show_alert=True
-        )
+    if not app:
+        bot.answer_callback_query(call.id, "Application not found.", show_alert=True)
         return
 
-    if action not in ("app", "rej"):
-        bot.answer_callback_query(call.id, "Invalid action.")
+    if not set_status(application_id, "approved", only_if="pending"):
+        bot.answer_callback_query(
+            call.id,
+            "This application has already been processed.",
+            show_alert=True
+        )
         return
 
     app = get_application(application_id)
 
-    if not app:
-        bot.answer_callback_query(
-            call.id,
-            "Application not found.",
-            show_alert=True
+    if app["for_friend"]:
+        user_text = (
+            "🎉 <b>Payment Approved!</b>\n\n"
+            f"The ticket for <b>{safe(app['fio'])}</b> is confirmed! 🌲\n"
+            "📅 November 8 · ⏰ Meeting at 06:30\n\n"
+            "Please send them this link to join the trip group:\n"
+            f"{safe(INVITE_LINK)}\n\n"
+            "🎟️ <b>Want to buy one more ticket?</b>"
         )
-        return
+    else:
+        user_text = (
+            "🎉 <b>Payment Approved!</b>\n\n"
+            "Welcome to the Suqoq Forest Trip! 🌲\n"
+            "📅 November 8 · ⏰ Meeting at 06:30\n\n"
+            "Join our private group for trip updates and logistics "
+            "(meeting point, what to bring, etc.):\n"
+            f"{safe(INVITE_LINK)}\n\n"
+            "🎟️ <b>Want to buy a ticket for someone else?</b>\n"
+            "You can register another participant below."
+        )
 
-    new_status = (
-        "approved" if action == "app"
-        else "rejected"
+    markup = types.InlineKeyboardMarkup()
+    markup.add(
+        types.InlineKeyboardButton(
+            "🎟️ Buy a ticket for someone else",
+            callback_data="buy_another"
+        )
     )
 
-    # Only one click can process a pending application.
-    with get_db() as conn:
-        result = conn.execute("""
-            UPDATE applications
-            SET status = ?,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE application_id = ?
-              AND status = 'pending'
-        """, (
-            new_status,
-            application_id
-        ))
-
-        if result.rowcount != 1:
-            bot.answer_callback_query(
-                call.id,
-                "This application has already been processed.",
-                show_alert=True
-            )
-            return
-
-    user_id = app["user_id"]
-
     try:
-        if action == "app":
-            markup = types.InlineKeyboardMarkup()
-
-            markup.add(
-                types.InlineKeyboardButton(
-                    "🎟️ Buy a ticket for someone else",
-                    callback_data="buy_another"
-                )
-            )
-
-            bot.send_message(
-                user_id,
-                "🎉 <b>Payment Approved!</b>\n\n"
-                "Your payment has been verified successfully!\n\n"
-                "Welcome to the Suqoq Forest Trip! 🌲\n"
-                "📅 November 8 · ⏰ Meeting at 06:30\n\n"
-                "Join our private group for trip updates and logistics "
-                "(meeting point, what to bring, etc.):\n"
-                f"{safe(INVITE_LINK)}\n\n"
-                "🎟️ <b>Want to buy a ticket for someone else?</b>\n"
-                "You can register another participant below.",
-                reply_markup=markup
-            )
-
-            approver = (
-                f"@{call.from_user.username}"
-                if call.from_user.username
-                else call.from_user.first_name
-            )
-
-            if save_to_sheet(app, approver):
-                result_text = (
-                    f"\n\n🟢 <b>APPROVED</b> by {safe(approver)}"
-                    "\n📋 Added to the participants sheet"
-                )
-            else:
-                result_text = (
-                    f"\n\n🟢 <b>APPROVED</b> by {safe(approver)}"
-                    "\n⚠️ NOT saved to the sheet — add manually"
-                )
-
-        else:
-            bot.send_message(
-                user_id,
-                "❌ Unfortunately, your payment could not be verified.\n\n"
-                "If you think this is an error, please contact Nazar:\n"
-                f"{safe(ADMIN_CONTACT)}"
-            )
-
-            result_text = "\n\n🔴 <b>REJECTED</b>"
-
+        bot.send_message(app["user_id"], user_text, reply_markup=markup)
     except Exception:
-        logger.exception(
-            "Could not notify user %s",
-            user_id
-        )
-
-        # Return to pending so the decision can be retried.
-        with get_db() as conn:
-            conn.execute("""
-                UPDATE applications
-                SET status = 'pending',
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE application_id = ?
-                  AND status = ?
-            """, (
-                application_id,
-                new_status
-            ))
-
+        logger.exception("Could not notify user %s", app["user_id"])
+        set_status(application_id, "pending", only_if="approved")
         bot.answer_callback_query(
             call.id,
             "Could not notify the user. Try again.",
@@ -882,26 +1151,166 @@ def process_admin_decision(call):
         )
         return
 
-    try:
-        old_caption = call.message.caption or ""
+    approver = approver_name(call)
 
-        bot.edit_message_caption(
+    if save_to_sheet(app, approver):
+        sheet_line = "\n📋 Added to the participants sheet"
+    else:
+        sheet_line = "\n⚠️ NOT saved to the sheet — add manually"
+
+    edit_admin_caption(
+        call,
+        f"\n\n🟢 <b>APPROVED</b> by {safe(approver)}{sheet_line}"
+    )
+
+    bot.answer_callback_query(call.id, "Approved.")
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data.startswith("rej_")
+)
+def reject_menu(call):
+    application_id = call.data.split("_", 1)[1]
+
+    try:
+        bot.edit_message_reply_markup(
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
-            caption=old_caption + result_text,
-            parse_mode="HTML",
-            reply_markup=None
+            reply_markup=reject_reasons_markup(application_id)
         )
-
     except Exception:
-        logger.exception(
-            "Could not update admin receipt message"
-        )
+        logger.exception("Could not show reject reasons")
 
-    bot.answer_callback_query(
-        call.id,
-        "Decision recorded."
+    bot.answer_callback_query(call.id, "Choose a reason")
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data.startswith("back_")
+)
+def reject_back(call):
+    application_id = call.data.split("_", 1)[1]
+
+    try:
+        bot.edit_message_reply_markup(
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=decision_markup(application_id)
+        )
+    except Exception:
+        logger.exception("Could not restore decision buttons")
+
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data.startswith("rr_")
+)
+def reject_with_reason(call):
+    try:
+        _, code, application_id = call.data.split("_", 2)
+    except ValueError:
+        bot.answer_callback_query(call.id, "Invalid action.")
+        return
+
+    reason = REJECT_REASONS.get(code, REJECT_REASONS["4"])
+    app = get_application(application_id)
+
+    if not app:
+        bot.answer_callback_query(call.id, "Application not found.", show_alert=True)
+        return
+
+    if not set_status(
+        application_id,
+        "rejected",
+        only_if="pending",
+        extra={"reject_reason": reason}
+    ):
+        bot.answer_callback_query(
+            call.id,
+            "This application has already been processed.",
+            show_alert=True
+        )
+        return
+
+    markup = types.InlineKeyboardMarkup()
+    markup.add(
+        types.InlineKeyboardButton(
+            "📤 Send a new receipt",
+            callback_data=f"resend_{application_id}"
+        )
     )
+
+    try:
+        bot.send_message(
+            app["user_id"],
+            "❌ <b>Your payment could not be verified.</b>\n\n"
+            f"<b>Reason:</b> {safe(reason)}\n\n"
+            "You can send a new receipt with the button below.\n"
+            f"Questions: contact Nazar {safe(ADMIN_CONTACT)}",
+            reply_markup=markup
+        )
+    except Exception:
+        logger.exception("Could not notify user %s", app["user_id"])
+        set_status(application_id, "pending", only_if="rejected")
+        bot.answer_callback_query(
+            call.id,
+            "Could not notify the user. Try again.",
+            show_alert=True
+        )
+        return
+
+    edit_admin_caption(
+        call,
+        f"\n\n🔴 <b>REJECTED</b> by {safe(approver_name(call))}\n"
+        f"Reason: {safe(reason)}"
+    )
+
+    bot.answer_callback_query(call.id, "Rejected.")
+
+
+# ---------------- REMINDERS ----------------
+
+def reminder_loop():
+    while True:
+        time.sleep(1800)
+
+        try:
+            if spots_left() <= 0:
+                continue
+
+            with get_db() as conn:
+                apps = conn.execute("""
+                    SELECT *
+                    FROM applications
+                    WHERE status = 'awaiting_receipt'
+                      AND reminded = 0
+                      AND updated_at <= datetime('now', ?)
+                """, (f"-{REMINDER_HOURS} hours",)).fetchall()
+
+            for app in apps:
+                try:
+                    bot.send_message(
+                        app["user_id"],
+                        "⏰ <b>Your spot is not reserved yet!</b>\n\n"
+                        "You filled in the form for the Suqoq Forest Trip "
+                        "but haven't sent the payment receipt.\n"
+                        f"🔥 Spots left: {spots_left()} of {MAX_SPOTS}\n\n"
+                        "Transfer the payment and send the receipt here "
+                        "as a photo or PDF.\n\n"
+                        + payment_details_text()
+                    )
+                except Exception:
+                    logger.warning("Reminder failed for %s", app["user_id"])
+
+                with get_db() as conn:
+                    conn.execute(
+                        "UPDATE applications SET reminded = 1 "
+                        "WHERE application_id = ?",
+                        (app["application_id"],)
+                    )
+
+        except Exception:
+            logger.exception("Reminder loop error")
 
 
 # ---------------- RUN ----------------
@@ -909,10 +1318,9 @@ def process_admin_decision(call):
 if __name__ == "__main__":
     init_db()
 
-    threading.Thread(
-        target=run_web_server,
-        daemon=True
-    ).start()
+    threading.Thread(target=run_web_server, daemon=True).start()
+    threading.Thread(target=keep_alive, daemon=True).start()
+    threading.Thread(target=reminder_loop, daemon=True).start()
 
     logger.info("Bot is starting...")
 
