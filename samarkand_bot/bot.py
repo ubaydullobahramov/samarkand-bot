@@ -7,7 +7,9 @@ import socketserver
 import logging
 import uuid
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 
+import requests
 import telebot
 from telebot import types
 
@@ -17,7 +19,7 @@ from telebot import types
 TOKEN = '8952248333:AAHsfLXQ7TgQoleDgMsYrRFU0j7Y6pa8rgA'
 
 ADMIN_GROUP_ID = -5563061387
-INVITE_LINK = 'https://t.me/+EZ9s8IqwbpMxZTcy'
+INVITE_LINK = 'https://t.me/+1LxiUshcGVU4YzBi'
 ADMIN_CONTACT = '@uwedsuadmin'
 
 CARD_NUMBER = '5614 6821 0314 3055'
@@ -25,6 +27,14 @@ CARD_HOLDER = 'BAXRAMOV UBAYDULLO'
 PRICE = '169,000 UZS'
 
 TRIP_NAME = 'SUQOQ FOREST TRIP'
+
+# Google Sheet with the list of approved participants.
+# Paste the Web App URL from Google Apps Script here (see instructions).
+SHEET_WEBHOOK_URL = 'https://script.google.com/macros/s/AKfycbyU68a5zkIbXDMQyOm0mz9BhXEDQRjs4I7Qr43dZbTvzUcchNKBKq_Q6m3Qb3YxDrOI/exec'
+# Must be the same word as SECRET in the Apps Script code.
+SHEET_SECRET = 'suqoq-2026'
+
+TASHKENT_TZ = timezone(timedelta(hours=5))
 
 PORT = int(os.environ.get("PORT", "10000"))
 DB_PATH = os.environ.get("DB_PATH", "bot_data.sqlite3")
@@ -262,6 +272,48 @@ def send_to_admin(method, *args, **kwargs):
 
         ADMIN_GROUP_ID = new_id
         return method(ADMIN_GROUP_ID, *args, **kwargs)
+
+
+def save_to_sheet(app, approved_by):
+    """
+    Adds an approved participant to the Google Sheet.
+    Returns True if the row was written, False otherwise.
+    """
+    if not SHEET_WEBHOOK_URL:
+        logger.warning("SHEET_WEBHOOK_URL is empty — sheet saving is off")
+        return False
+
+    payload = {
+        "secret": SHEET_SECRET,
+        "approved_at": datetime.now(TASHKENT_TZ).strftime("%d.%m.%Y %H:%M"),
+        "fio": app["fio"] or "",
+        "phone": app["phone"] or "",
+        "university": app["university"] or "",
+        "username": app["username"] or "",
+        "user_id": str(app["user_id"]),
+        "application_id": app["application_id"],
+        "approved_by": approved_by or "",
+    }
+
+    try:
+        response = requests.post(
+            SHEET_WEBHOOK_URL,
+            json=payload,
+            timeout=20
+        )
+        if response.ok and response.text.strip() == "ok":
+            return True
+
+        logger.error(
+            "Sheet answered %s: %s",
+            response.status_code,
+            response.text[:200]
+        )
+        return False
+
+    except Exception:
+        logger.exception("Failed to save participant to sheet")
+        return False
 
 
 def notify_admin_lead(application_id):
@@ -777,7 +829,22 @@ def process_admin_decision(call):
                 reply_markup=markup
             )
 
-            result_text = "\n\n🟢 <b>APPROVED</b>"
+            approver = (
+                f"@{call.from_user.username}"
+                if call.from_user.username
+                else call.from_user.first_name
+            )
+
+            if save_to_sheet(app, approver):
+                result_text = (
+                    f"\n\n🟢 <b>APPROVED</b> by {safe(approver)}"
+                    "\n📋 Added to the participants sheet"
+                )
+            else:
+                result_text = (
+                    f"\n\n🟢 <b>APPROVED</b> by {safe(approver)}"
+                    "\n⚠️ NOT saved to the sheet — add manually"
+                )
 
         else:
             bot.send_message(
