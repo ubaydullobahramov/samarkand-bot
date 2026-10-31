@@ -22,10 +22,16 @@ ADMIN_CONTACT = '@uwedsuadmin'
 
 CARD_NUMBER = '5614 6821 0314 3055'
 CARD_HOLDER = 'BAXRAMOV UBAYDULLO'
-PRICE = '299,000 UZS'
+PRICE = '169,000 UZS'
+
+TRIP_NAME = 'SUQOQ FOREST TRIP'
 
 PORT = int(os.environ.get("PORT", "10000"))
 DB_PATH = os.environ.get("DB_PATH", "bot_data.sqlite3")
+
+# Put the trip poster next to this file as poster.jpg (or poster.png).
+# If no poster file is found, the bot falls back to PHOTO_URL.
+POSTER_FILES = ("poster.jpg", "poster.jpeg", "poster.png")
 PHOTO_URL = "https://picsum.photos/800/500"
 
 
@@ -234,7 +240,7 @@ def notify_admin_lead(application_id):
         return
 
     lead = (
-        "⚠️ <b>APPLICATION — PAYMENT DETAILS SENT</b>\n\n"
+        f"⚠️ <b>APPLICATION — PAYMENT DETAILS SENT — {safe(TRIP_NAME)}</b>\n\n"
         f"🎫 <b>Application:</b> "
         f"<code>{safe(application_id)}</code>\n"
         f"👤 <b>Name:</b> {safe(app['fio'])}\n"
@@ -261,18 +267,23 @@ def start_cmd(message):
     username = message.from_user.username or "no_username"
 
     caption = (
-        "🕌 <b>JOURNEY TO ANCIENT SAMARKAND!</b>\n\n"
-        "Get ready to explore the heart of the Silk Road with us!\n\n"
+        "🌲 <b>JOURNEY TO SUQOQ FOREST!</b>\n\n"
+        "Get ready to escape the city and explore "
+        "the Suqoq mountains with us!\n\n"
         "<b>What's included:</b>\n"
         "🚌 Comfortable transportation (there & back)\n"
+        "🥾 Hiking through forest trails and mountain views\n"
         "📸 Professional photographer\n"
-        "🍲 Delicious Zigir Osh from the center of Samarkand\n"
+        "🥪 Sandwich for lunch on the trail\n"
+        "🥤 Refreshing drinks\n"
         "🎲 UNO & Mafia games\n"
         "👥 Great team & energetic vibe\n\n"
-        "📅 <b>Date:</b> October 25\n"
+        "📅 <b>Date:</b> November 8 (Sunday)\n"
+        "⏰ <b>Meeting:</b> 06:30\n"
+        "📍 <b>Destination:</b> Suqoq, Tashkent region\n"
         f"💰 <b>Price:</b> {safe(PRICE)}\n"
-        "⚡ <b>Spots:</b> Limited to 100 places only!\n\n"
-        "Ready to travel back in time with us?"
+        "⚡ <b>Spots:</b> Limited to 150 places only!\n\n"
+        "Ready for the mountains?"
     )
 
     markup = types.InlineKeyboardMarkup()
@@ -284,13 +295,27 @@ def start_cmd(message):
         )
     )
 
+    poster_path = next(
+        (p for p in POSTER_FILES if os.path.exists(p)),
+        None
+    )
+
     try:
-        bot.send_photo(
-            user_id,
-            PHOTO_URL,
-            caption=caption,
-            reply_markup=markup
-        )
+        if poster_path:
+            with open(poster_path, "rb") as poster:
+                bot.send_photo(
+                    user_id,
+                    poster,
+                    caption=caption,
+                    reply_markup=markup
+                )
+        else:
+            bot.send_photo(
+                user_id,
+                PHOTO_URL,
+                caption=caption,
+                reply_markup=markup
+            )
     except Exception:
         logger.exception("Could not send welcome photo")
         bot.send_message(
@@ -553,7 +578,7 @@ def get_receipt(message, application_id):
     app = get_application(application_id)
 
     caption = (
-        "💳 <b>NEW PAYMENT FOR VERIFICATION — SAMARKAND TRIP</b>\n\n"
+        f"💳 <b>NEW PAYMENT FOR VERIFICATION — {safe(TRIP_NAME)}</b>\n\n"
         f"🎫 <b>Application:</b> "
         f"<code>{safe(application_id)}</code>\n"
         f"👤 <b>Name:</b> {safe(app['fio'])}\n"
@@ -700,8 +725,10 @@ def process_admin_decision(call):
                 user_id,
                 "🎉 <b>Payment Approved!</b>\n\n"
                 "Your payment has been verified successfully!\n\n"
-                "Welcome to the Samarkand trip. Join our private "
-                "group for trip updates and logistics:\n"
+                "Welcome to the Suqoq Forest Trip! 🌲\n"
+                "📅 November 8 · ⏰ Meeting at 06:30\n\n"
+                "Join our private group for trip updates and logistics "
+                "(meeting point, what to bring, etc.):\n"
                 f"{safe(INVITE_LINK)}\n\n"
                 "🎟️ <b>Want to buy a ticket for someone else?</b>\n"
                 "You can register another participant below.",
