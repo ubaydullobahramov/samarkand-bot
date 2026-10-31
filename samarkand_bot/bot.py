@@ -14,7 +14,7 @@ from telebot import types
 
 # ---------------- CONFIG ----------------
 
-TOKEN = '8952248333:AAGAKzBkfbALsyoeXt9CoGuLuKNRz4GLLLk'
+TOKEN = '8952248333:AAHsfLXQ7TgQoleDgMsYrRFU0j7Y6pa8rgA'
 
 ADMIN_GROUP_ID = -4487103832
 INVITE_LINK = 'https://t.me/+EZ9s8IqwbpMxZTcy'
