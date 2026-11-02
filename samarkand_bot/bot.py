@@ -19,7 +19,7 @@ from telebot import types
 
 TOKEN = '9152149200:AAHI1r2wRS338HndDpcIrJNUVE7dWYOKj_Q'
 
-ADMIN_GROUP_ID = -5563061387
+ADMIN_GROUP_ID = -1004440919191
 INVITE_LINK = 'https://t.me/+1LxiUshcGVU4YzBi'
 ADMIN_CONTACT = '@uwedsuadmin'
 
