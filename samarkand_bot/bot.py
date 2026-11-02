@@ -17,7 +17,7 @@ from telebot import types
 
 # ---------------- CONFIG ----------------
 
-TOKEN = '8952248333:AAHsfLXQ7TgQoleDgMsYrRFU0j7Y6pa8rgA'
+TOKEN = '9152149200:AAHI1r2wRS338HndDpcIrJNUVE7dWYOKj_Q'
 
 ADMIN_GROUP_ID = -5563061387
 INVITE_LINK = 'https://t.me/+1LxiUshcGVU4YzBi'
@@ -31,11 +31,24 @@ PRICE_UZS = 169000
 TRIP_NAME = 'SUQOQ FOREST TRIP'
 
 # Total number of spots. Pending + approved applications take a spot.
+# Users never see how many are left — the bot just closes registration
+# quietly when the limit is reached.
 MAX_SPOTS = 130
 
-# Remind people who filled the form but did not send a receipt
-# after this many hours (one reminder per application).
-REMINDER_HOURS = 12
+# If the bot was redeployed after sales started, the database is empty
+# again. Put here how many people are ALREADY approved in the Google Sheet,
+# so the limit and /stats stay correct.
+SOLD_BEFORE_RESTART = 6
+
+# Reminders for people who pressed /start but did not buy a ticket.
+# Hours after their first /start. One message per step, 3 steps.
+REMINDER_SCHEDULE_HOURS = (3, 24, 48)
+
+# No reminders at night (Tashkent time): from 23:00 to 09:00.
+QUIET_HOURS = (23, 9)
+
+# No reminders after this moment (the evening before the trip).
+REMINDERS_STOP_AT = datetime(2026, 11, 7, 22, 0)
 
 # Google Sheet with the list of approved participants.
 SHEET_WEBHOOK_URL = 'https://script.google.com/macros/s/AKfycby2ramJijYp6_lg0ERDq5HPzCsIoERhpCoa_BHrF_LCIJ-Sip31nW3HxZ9nshl1WEwq/exec'
@@ -152,6 +165,31 @@ def init_db():
             ON applications(status)
         """)
 
+        # Everyone who pressed /start — used for reminders.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                reminder_stage INTEGER NOT NULL DEFAULT 0,
+                last_reminder_at TEXT,
+                unsubscribed INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+
+
+def remember_user(user):
+    with get_db() as conn:
+        conn.execute("""
+            INSERT OR IGNORE INTO users (user_id, username, first_name)
+            VALUES (?, ?, ?)
+        """, (
+            user.id,
+            user.username or "",
+            user.first_name or ""
+        ))
+
 
 def safe(value):
     return html.escape(str(value or ""), quote=True)
@@ -253,7 +291,7 @@ def taken_spots():
             FROM applications
             WHERE status IN ('pending', 'approved')
         """).fetchone()
-        return row["n"]
+        return row["n"] + SOLD_BEFORE_RESTART
 
 
 def spots_left():
@@ -554,48 +592,6 @@ def ask_for_step(chat_id, app):
         )
 
 
-def tickets_left_text(left):
-    """Excited message about how many tickets are left."""
-    if left <= 0:
-        return (
-            f"😔 <b>SOLD OUT!</b> All {MAX_SPOTS} tickets are gone.\n\n"
-            "Thank you for your interest! Follow our channels "
-            "so you don't miss the next trip.\n"
-            f"Questions: {safe(ADMIN_CONTACT)}"
-        )
-
-    if left == MAX_SPOTS:
-        return (
-            "🤩 <b>WOW, you're right on time!</b>\n\n"
-            f"All <b>{MAX_SPOTS} tickets</b> are still available — "
-            "be the very first to grab yours! 🥇"
-        )
-
-    if left > 50:
-        return (
-            "😍 <b>WOW, you can still make it!</b>\n\n"
-            f"🎟 <b>{left} of {MAX_SPOTS}</b> tickets left — "
-            "grab yours before they're gone!"
-        )
-
-    if left > 20:
-        return (
-            "🔥 <b>Tickets are going fast!</b>\n\n"
-            f"🎟 Only <b>{left} of {MAX_SPOTS}</b> tickets left!"
-        )
-
-    if left > 5:
-        return (
-            "⚡ <b>HURRY UP!</b>\n\n"
-            f"🎟 Only <b>{left}</b> tickets left!"
-        )
-
-    return (
-        f"🚨 <b>LAST {left} TICKET{'S' if left > 1 else ''}!</b>\n\n"
-        "Don't miss your chance — register right now!"
-    )
-
-
 def approved_count():
     with get_db() as conn:
         row = conn.execute("""
@@ -603,13 +599,21 @@ def approved_count():
             FROM applications
             WHERE status = 'approved'
         """).fetchone()
-        return row["n"]
+        return row["n"] + SOLD_BEFORE_RESTART
+
+
+def ticket_button(text="🎟 Get my ticket ➡️"):
+    markup = types.InlineKeyboardMarkup()
+    markup.add(
+        types.InlineKeyboardButton(text, callback_data="step_fio")
+    )
+    return markup
 
 
 def full_message(chat_id):
     bot.send_message(
         chat_id,
-        f"😔 <b>All {MAX_SPOTS} spots are taken.</b>\n\n"
+        "😔 <b>SOLD OUT!</b> All tickets are gone.\n\n"
         "Registration for the Suqoq Forest Trip is closed. "
         f"Questions: {safe(ADMIN_CONTACT)}",
         reply_markup=types.ReplyKeyboardRemove()
@@ -653,7 +657,8 @@ def start_cmd(message):
         return
 
     user_id = message.from_user.id
-    left = spots_left()
+    remember_user(message.from_user)
+    sold_out = spots_left() <= 0
 
     caption = (
         "🌲 <b>JOURNEY TO SUQOQ FOREST!</b>\n\n"
@@ -670,8 +675,16 @@ def start_cmd(message):
         "📅 <b>Date:</b> November 8 (Sunday)\n"
         "⏰ <b>Meeting:</b> 06:30\n"
         "📍 <b>Destination:</b> Suqoq, Tashkent region\n"
-        f"💰 <b>Price:</b> {safe(PRICE)}"
+        f"💰 <b>Price:</b> {safe(PRICE)}\n\n"
+        + (
+            "😔 <b>SOLD OUT!</b> All tickets are gone. "
+            "Follow our channels so you don't miss the next trip!"
+            if sold_out else
+            "Ready for the mountains? 🏔"
+        )
     )
+
+    markup = None if sold_out else ticket_button()
 
     poster_path = next(
         (p for p in POSTER_FILES if os.path.exists(p)),
@@ -681,25 +694,16 @@ def start_cmd(message):
     try:
         if poster_path:
             with open(poster_path, "rb") as poster:
-                bot.send_photo(user_id, poster, caption=caption)
+                bot.send_photo(
+                    user_id, poster, caption=caption, reply_markup=markup
+                )
         else:
-            bot.send_photo(user_id, PHOTO_URL, caption=caption)
+            bot.send_photo(
+                user_id, PHOTO_URL, caption=caption, reply_markup=markup
+            )
     except Exception:
         logger.exception("Could not send welcome photo")
-        bot.send_message(user_id, caption)
-
-    # Separate message with the number of tickets left + the button.
-    markup = None
-    if left > 0:
-        markup = types.InlineKeyboardMarkup()
-        markup.add(
-            types.InlineKeyboardButton(
-                "🎟 Get my ticket ➡️",
-                callback_data="step_fio"
-            )
-        )
-
-    bot.send_message(user_id, tickets_left_text(left), reply_markup=markup)
+        bot.send_message(user_id, caption, reply_markup=markup)
 
 
 @bot.message_handler(commands=["cancel"])
@@ -726,6 +730,26 @@ def cancel_cmd(message):
     )
 
 
+@bot.message_handler(commands=["stop"])
+def stop_cmd(message):
+    if message.chat.type != "private":
+        return
+
+    remember_user(message.from_user)
+
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE users SET unsubscribed = 1 WHERE user_id = ?",
+            (message.from_user.id,)
+        )
+
+    bot.send_message(
+        message.chat.id,
+        "👌 Got it — no more reminders.\n"
+        "If you change your mind, just send /start 🙂"
+    )
+
+
 @bot.message_handler(commands=["stats"])
 def stats_cmd(message):
     if not is_admin_chat(message):
@@ -738,18 +762,29 @@ def stats_cmd(message):
             GROUP BY status
         """).fetchall()
 
+        users = conn.execute("""
+            SELECT
+                COUNT(*) AS started,
+                SUM(CASE WHEN reminder_stage > 0 THEN 1 ELSE 0 END) AS reminded,
+                SUM(unsubscribed) AS stopped
+            FROM users
+        """).fetchone()
+
     counts = {row["status"]: row["n"] for row in rows}
     filling = sum(
         counts.get(s, 0)
         for s in ("collecting_fio", "collecting_phone", "collecting_university")
     )
-    approved = counts.get("approved", 0)
+    approved = counts.get("approved", 0) + SOLD_BEFORE_RESTART
     pending = counts.get("pending", 0)
 
     collected = f"{approved * PRICE_UZS:,}".replace(",", " ")
 
     text = (
         f"📊 <b>{safe(TRIP_NAME)} — STATS</b>\n\n"
+        f"👀 Pressed /start: {users['started'] or 0}\n"
+        f"🔔 Got at least one reminder: {users['reminded'] or 0}\n"
+        f"🔕 Unsubscribed (/stop or blocked): {users['stopped'] or 0}\n\n"
         f"✍️ Filling the form: {filling}\n"
         f"⏳ Got payment details, no receipt: {counts.get('awaiting_receipt', 0)}\n"
         f"🔎 Receipts waiting for review: {pending}\n"
@@ -763,18 +798,62 @@ def stats_cmd(message):
     bot.reply_to(message, text)
 
 
-@bot.message_handler(commands=["broadcast"])
+# Who receives each broadcast command.
+BROADCAST_AUDIENCES = {
+    # Paid and approved participants (trip logistics). Always delivered.
+    "broadcast": (
+        "approved participants",
+        """
+        SELECT DISTINCT user_id
+        FROM applications
+        WHERE status = 'approved'
+        """,
+        False,
+    ),
+    # Everyone who ever pressed /start (except those who sent /stop).
+    "broadcast_all": (
+        "everyone who pressed /start",
+        """
+        SELECT user_id FROM users WHERE unsubscribed = 0
+        UNION
+        SELECT DISTINCT user_id FROM applications
+        WHERE user_id NOT IN (SELECT user_id FROM users WHERE unsubscribed = 1)
+        """,
+        True,
+    ),
+    # Pressed /start but did not buy yet (except those who sent /stop).
+    "broadcast_unpaid": (
+        "people who have not bought a ticket yet",
+        """
+        SELECT user_id FROM users
+        WHERE unsubscribed = 0
+          AND user_id NOT IN (
+              SELECT user_id FROM applications
+              WHERE status IN ('pending', 'approved')
+          )
+        """,
+        True,
+    ),
+}
+
+
+@bot.message_handler(commands=list(BROADCAST_AUDIENCES))
 def broadcast_cmd(message):
     if not is_admin_chat(message):
         return
 
     parts = (message.text or "").split(maxsplit=1)
+    command = parts[0].lstrip("/").split("@")[0].lower()
+    audience_name, query, with_button = BROADCAST_AUDIENCES[command]
 
     if len(parts) < 2 or not parts[1].strip():
         bot.reply_to(
             message,
-            "Usage: <code>/broadcast your message</code>\n"
-            "The message is sent privately to every approved participant."
+            "📢 <b>Broadcast commands</b>\n\n"
+            "<code>/broadcast text</code> — approved participants\n"
+            "<code>/broadcast_all text</code> — everyone who pressed /start\n"
+            "<code>/broadcast_unpaid text</code> — pressed /start but haven't bought\n\n"
+            "Messages to everyone / unpaid get a «🎟 Get my ticket» button."
         )
         return
 
@@ -784,29 +863,40 @@ def broadcast_cmd(message):
     )
 
     with get_db() as conn:
-        user_ids = [
-            row["user_id"]
-            for row in conn.execute("""
-                SELECT DISTINCT user_id
-                FROM applications
-                WHERE status = 'approved'
-            """).fetchall()
-        ]
+        user_ids = [row["user_id"] for row in conn.execute(query).fetchall()]
 
     if not user_ids:
-        bot.reply_to(message, "No approved participants yet.")
+        bot.reply_to(message, f"Nobody to send to ({audience_name}).")
         return
 
     bot.reply_to(
         message,
-        f"📤 Sending to {len(user_ids)} participants..."
+        f"📤 Sending to {len(user_ids)} — {audience_name}..."
     )
 
     def worker():
         sent, failed = 0, 0
         for uid in user_ids:
             try:
-                bot.send_message(uid, text)
+                markup = None
+                if with_button:
+                    active = get_active_application(uid)
+                    markup = ticket_button(
+                        "💳 Finish my registration ➡️"
+                        if active and active["status"] == "awaiting_receipt"
+                        else "🎟 Get my ticket ➡️"
+                    )
+                    # Approved people in «all» don't need a buy button.
+                    with get_db() as conn:
+                        bought = conn.execute(
+                            "SELECT 1 FROM applications WHERE user_id = ? "
+                            "AND status IN ('pending', 'approved') LIMIT 1",
+                            (uid,)
+                        ).fetchone()
+                    if bought:
+                        markup = None
+
+                bot.send_message(uid, text, reply_markup=markup)
                 sent += 1
             except Exception:
                 failed += 1
@@ -815,7 +905,8 @@ def broadcast_cmd(message):
         try:
             bot.send_message(
                 message.chat.id,
-                f"✅ Broadcast finished: {sent} sent, {failed} failed."
+                f"✅ Broadcast finished ({audience_name}): "
+                f"{sent} sent, {failed} failed."
             )
         except Exception:
             logger.exception("Could not report broadcast result")
@@ -1144,11 +1235,6 @@ def approve_application(call):
     app = get_application(application_id)
     ticket_no = approved_count()
 
-    first_line = (
-        "🥇 <b>You got the VERY FIRST ticket — legend!</b>\n"
-        if ticket_no == 1 else ""
-    )
-
     thanks = (
         "🙏 <b>Thank you from the organizers — "
         "UWED Students' Union & DiploFrame!</b>\n"
@@ -1158,9 +1244,7 @@ def approve_application(call):
     if app["for_friend"]:
         user_text = (
             "🎉 <b>CONGRATULATIONS! The ticket is confirmed!</b>\n\n"
-            f"🎟 Ticket <b>#{ticket_no}</b> of {MAX_SPOTS} — "
-            f"for <b>{safe(app['fio'])}</b>\n"
-            f"{first_line}\n"
+            f"🎟 Ticket for <b>{safe(app['fio'])}</b> — you're both in! 🌲\n\n"
             "📅 November 8 · ⏰ Meeting at 06:30\n\n"
             "Please send them this link to join the trip group:\n"
             f"{safe(INVITE_LINK)}\n\n"
@@ -1169,8 +1253,7 @@ def approve_application(call):
     else:
         user_text = (
             "🎉 <b>CONGRATULATIONS! Your ticket is confirmed!</b>\n\n"
-            f"🎟 You are participant <b>#{ticket_no}</b> of {MAX_SPOTS}\n"
-            f"{first_line}\n"
+            "Welcome to the Suqoq Forest Trip — you're officially in! 🌲\n\n"
             "📅 November 8 · ⏰ Meeting at 06:30\n\n"
             "Join our private group for trip updates and logistics "
             "(meeting point, what to bring, etc.):\n"
@@ -1319,45 +1402,142 @@ def reject_with_reason(call):
 
 # ---------------- REMINDERS ----------------
 
-def reminder_loop():
-    while True:
-        time.sleep(1800)
+# One text per step of REMINDER_SCHEDULE_HOURS.
+REMINDER_TEXTS = (
+    "👀 <b>P.S. bro, you're coming to Suqoq, right?</b>\n\n"
+    "November 8 — forest trails, mountain views, fresh air and the best "
+    "crew from Tashkent universities 🏔\n\n"
+    "Don't leave it for later — getting a ticket takes 2 minutes 👇",
+
+    "🤫 <b>Has anyone told you yet that we throw really good events?</b>\n\n"
+    "Ask anyone who's been on our trips 😉\n"
+    "Suqoq Forest Trip on November 8: hiking, a photographer, games on "
+    "the bus and lunch on us. You'll regret missing this one 😅\n\n"
+    "Grab your ticket 👇",
+
+    "🔥 <b>Psst... did you know another event is coming soon — "
+    "one we haven't done in a long time?</b> 👀\n\n"
+    "Our Suqoq crew will be the first to hear about it.\n"
+    "Be part of the crew — see you in the mountains on November 8 🏔\n\n"
+    "Last call 👇",
+)
+
+UNFINISHED_LINE = (
+    "\n\n💳 <i>Your form is already filled in — just transfer the payment "
+    "and send the receipt here.</i>"
+)
+
+STOP_LINE = "\n\n<i>Not interested? Send /stop and we won't remind you again.</i>"
+
+
+def parse_utc(value):
+    try:
+        return datetime.strptime(value, "%Y-%m-%d %H:%M:%S").replace(
+            tzinfo=timezone.utc
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def reminders_allowed_now():
+    now = datetime.now(TASHKENT_TZ)
+
+    if now.replace(tzinfo=None) >= REMINDERS_STOP_AT:
+        return False
+
+    quiet_from, quiet_to = QUIET_HOURS
+    if now.hour >= quiet_from or now.hour < quiet_to:
+        return False
+
+    return spots_left() > 0
+
+
+def send_due_reminders():
+    """Sends the next reminder to everyone who is due. Returns how many."""
+    if not reminders_allowed_now():
+        return 0
+
+    with get_db() as conn:
+        users = conn.execute("""
+            SELECT *
+            FROM users
+            WHERE unsubscribed = 0
+              AND reminder_stage < ?
+              AND user_id NOT IN (
+                  SELECT user_id
+                  FROM applications
+                  WHERE status IN ('pending', 'approved')
+              )
+        """, (len(REMINDER_SCHEDULE_HOURS),)).fetchall()
+
+    now = datetime.now(timezone.utc)
+    sent = 0
+
+    for user in users:
+        stage = user["reminder_stage"]
+        started = parse_utc(user["started_at"])
+        last = parse_utc(user["last_reminder_at"])
+
+        if not started:
+            continue
+
+        due_at = started + timedelta(hours=REMINDER_SCHEDULE_HOURS[stage])
+        if now < due_at:
+            continue
+
+        # Never two reminders closer than 6 hours apart.
+        if last and now - last < timedelta(hours=6):
+            continue
+
+        text = REMINDER_TEXTS[min(stage, len(REMINDER_TEXTS) - 1)]
+        active = get_active_application(user["user_id"])
+
+        if active and active["status"] == "awaiting_receipt":
+            text += UNFINISHED_LINE
+            button = ticket_button("💳 Finish my registration ➡️")
+        elif active:
+            button = ticket_button("✍️ Continue my registration ➡️")
+        else:
+            button = ticket_button()
+
+        text += STOP_LINE
+        unsubscribe = 0
 
         try:
-            if spots_left() <= 0:
-                continue
+            bot.send_message(user["user_id"], text, reply_markup=button)
+            sent += 1
+        except telebot.apihelper.ApiTelegramException as e:
+            # 403 = the user blocked the bot: stop reminding them.
+            if getattr(e, "error_code", None) == 403:
+                unsubscribe = 1
+            else:
+                logger.warning("Reminder failed for %s: %s", user["user_id"], e)
+        except Exception:
+            logger.warning("Reminder failed for %s", user["user_id"])
 
-            with get_db() as conn:
-                apps = conn.execute("""
-                    SELECT *
-                    FROM applications
-                    WHERE status = 'awaiting_receipt'
-                      AND reminded = 0
-                      AND updated_at <= datetime('now', ?)
-                """, (f"-{REMINDER_HOURS} hours",)).fetchall()
+        with get_db() as conn:
+            conn.execute("""
+                UPDATE users
+                SET reminder_stage = reminder_stage + 1,
+                    last_reminder_at = CURRENT_TIMESTAMP,
+                    unsubscribed = MAX(unsubscribed, ?)
+                WHERE user_id = ?
+            """, (unsubscribe, user["user_id"]))
 
-            for app in apps:
-                try:
-                    bot.send_message(
-                        app["user_id"],
-                        "⏰ <b>Your spot is not reserved yet!</b>\n\n"
-                        "You filled in the form for the Suqoq Forest Trip "
-                        "but haven't sent the payment receipt.\n"
-                        f"🔥 Spots left: {spots_left()} of {MAX_SPOTS}\n\n"
-                        "Transfer the payment and send the receipt here "
-                        "as a photo or PDF.\n\n"
-                        + payment_details_text()
-                    )
-                except Exception:
-                    logger.warning("Reminder failed for %s", app["user_id"])
+        time.sleep(0.05)
 
-                with get_db() as conn:
-                    conn.execute(
-                        "UPDATE applications SET reminded = 1 "
-                        "WHERE application_id = ?",
-                        (app["application_id"],)
-                    )
+    if sent:
+        logger.info("Sent %s reminders", sent)
 
+    return sent
+
+
+def reminder_loop():
+    while True:
+        time.sleep(900)
+
+        try:
+            send_due_reminders()
         except Exception:
             logger.exception("Reminder loop error")
 
